@@ -1,28 +1,16 @@
 {
-  "name": "everclaw",
-  "version": "2026.4.19.0439",
+  "name": "buddy-bots",
+  "version": "2026.4.21.0410",
+  "private": true,
+  "description": "Agent-to-agent social coordination. Create a group, everyone gets a buddy bot that coordinates over XMTP.",
   "type": "module",
-  "description": "Open-source first AI inference via Morpheus decentralized network",
   "scripts": {
-    "test": "node --test tests/*.mjs",
-    "test:lib": "node --test tests/lib-*.mjs",
-    "test:encryption": "node --test tests/lib-encryption.mjs",
-    "test:docker": "node --test tests/lib-docker.mjs",
-    "test:keychain": "node --test tests/lib-keychain.mjs",
-    "test:manifest": "node --test tests/lib-manifest.mjs",
-    "test:memory": "node --test tests/memory-backend.mjs tests/mempalace-bridge.mjs",
-    "bootstrap": "node scripts/bootstrap-gateway.mjs"
+    "provision": "node scripts/buddy-provision.mjs",
+    "status": "node scripts/buddy-provision.mjs --status",
+    "setup-identity": "node scripts/setup-identity.mjs",
+    "buddy-chat": "node scripts/buddy-chat.mjs"
   },
-  "keywords": [
-    "morpheus",
-    "ai",
-    "inference",
-    "decentralized",
-    "openclaw",
-    "everclaw"
-  ],
-  "license": "MIT",
   "dependencies": {
-    "argon2": "^0.41.1"
+    "viem": "^2.0.0"
   }
 }

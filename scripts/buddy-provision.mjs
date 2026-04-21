@@ -1,698 +1,1000 @@
 #!/usr/bin/env node
 /**
- * buddy-provision.mjs — Dynamic Buddy Bot Provisioner
+ * buddy-provision.mjs — Buddy Bot Provisioner
  *
- * Provisions a new buddy bot for a group member:
+ * Provisions, manages, and removes buddy bots for group members.
+ * Each buddy bot gets an isolated workspace, XMTP identity, and agent config.
+ *
+ * Usage:
+ *   node scripts/buddy-provision.mjs --name "Alice" --phone "+15555551234" --trust personal
+ *   node scripts/buddy-provision.mjs --status
+ *   node scripts/buddy-provision.mjs --list
+ *   node scripts/buddy-provision.mjs --remove --agent-id alice
+ *   node scripts/buddy-provision.mjs --help
+ *
+ * Architecture:
  *   1. Creates workspace (chmod 700) with templated SOUL/USER/AGENTS
  *   2. Generates XMTP identity via setup-identity.mjs
  *   3. Injects agent entry into openclaw.json
- *   4. Updates buddy registry (via buddy-registry.mjs)
- *   5. Registers peer in comms-guard peers.json
- *   6. Reloads OpenClaw (SIGUSR1)
+ *   4. Creates per-agent daemon service (launchd macOS / systemd Linux)
+ *   5. Updates buddy registry (local JSON)
+ *   6. Registers peer in comms-guard peer list
+ *   7. Reloads OpenClaw (SIGUSR1)
+ *   8. Sends welcome DM
  *
- * Usage:
- *   node scripts/buddy-provision.mjs --name "Alice" --phone "+15125551234" --trust personal
- *   node scripts/buddy-provision.mjs --remove alice
- *   node scripts/buddy-provision.mjs --status
- *   node scripts/buddy-provision.mjs --list
- *   node scripts/buddy-provision.mjs --dry-run --name "Bob" --phone "+15125555678"
- *
- * Dependencies: Node built-ins + buddy-registry.mjs + setup-identity.mjs
+ * Dependencies: Node built-ins + setup-identity.mjs (local).
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, chmodSync, readdirSync, renameSync } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, rmSync, renameSync, statSync, chmodSync, copyFileSync } from 'node:fs';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { homedir, platform } from 'node:os';
+import { execSync } from 'node:child_process';
 
-import {
-  addBuddy,
-  removeBuddy as registryRemoveBuddy,
-  lookupByAgentId,
-  lookupByPhone,
-  listBuddies
-} from './buddy-registry.mjs';
+import { generateIdentity, hasIdentity, loadIdentity, removeIdentity, isValidAgentId, atomicWrite, readJsonSafe } from './setup-identity.mjs';
 
-// ── Paths ────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, '..');
-const HOME = process.env.HOME || '';
-const OPENCLAW_DIR = join(HOME, '.openclaw');
-const EVERCLAW_DIR = join(HOME, '.everclaw');
+const TEMPLATES_DIR = join(REPO_ROOT, 'templates');
+
+const HOME = homedir();
+const OPENCLAW_DIR = process.env.OPENCLAW_DIR || join(HOME, '.openclaw');
 const OPENCLAW_CONFIG = process.env.OPENCLAW_CONFIG || join(OPENCLAW_DIR, 'openclaw.json');
-const TEMPLATES_DIR = join(REPO_ROOT, 'claw-repos', 'buddybots.org', 'templates');
-const SETUP_IDENTITY = join(REPO_ROOT, 'skills', 'agent-chat', 'setup-identity.mjs');
+const EVERCLAW_DIR = process.env.EVERCLAW_DIR || join(HOME, '.everclaw');
+const WORKSPACE_BASE = process.env.WORKSPACE_BASE || join(OPENCLAW_DIR, 'workspaces');
 
-const VALID_TRUST_PROFILES = ['public', 'business', 'personal', 'financial', 'full'];
+const REGISTRY_DIR = join(EVERCLAW_DIR, 'buddy-registry');
+const REGISTRY_FILE = join(REGISTRY_DIR, 'registry.json');
+const PEERS_FILE = join(REGISTRY_DIR, 'peers.json');
 
-// Default model config for buddy bots — lighter than host agent
-const BUDDY_MODEL_CONFIG = {
-  primary: 'ollama/gemma4-26b-q3',
-  fallbacks: [
-    'morpheus/glm-5',
-    'ollama/qwen3.5:9b'
-  ]
-};
+const TRUST_LEVELS = ['public', 'business', 'personal', 'financial', 'full'];
+const VERSION = '1.0.0';
 
-// ── Utilities ────────────────────────────────────────────────────
+// ── Validation ───────────────────────────────────────────────────
 
 /**
- * Derive a safe agent ID from a human name.
- * "Alice" → "alice", "Bob Smith" → "bob-smith", "José María" → "jose-maria"
+ * Sanitize a name into a valid agent ID.
+ * Lowercases, replaces spaces/special chars with hyphens, trims.
+ * @param {string} name — Human-readable name
+ * @returns {string} Sanitized agent ID
  */
-export function deriveAgentId(name) {
-  return name
-    .normalize('NFD')                     // decompose accents
-    .replace(/[\u0300-\u036f]/g, '')      // strip diacritical marks
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')         // non-alphanum → hyphen
-    .replace(/^-+|-+$/g, '')             // trim leading/trailing hyphens
-    || 'buddy';                           // fallback if empty
-}
-
-/**
- * Get workspace path for an agent.
- */
-function getWorkspacePath(agentId) {
-  return join(OPENCLAW_DIR, `workspace-${agentId}`);
-}
-
-/**
- * Interpolate template variables in a string.
- */
-function interpolate(template, vars) {
-  let result = template;
-  for (const [key, value] of Object.entries(vars)) {
-    result = result.replaceAll(`{{${key}}}`, value);
+export function nameToAgentId(name) {
+  if (!name || typeof name !== 'string') {
+    throw new Error('Name is required.');
   }
+  const sanitized = name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!sanitized) {
+    throw new Error(`Cannot derive agent ID from name: "${name}"`);
+  }
+  if (!isValidAgentId(sanitized)) {
+    throw new Error(`Derived agent ID "${sanitized}" is invalid. Use --agent-id to specify manually.`);
+  }
+  return sanitized;
+}
+
+/**
+ * Validate a phone number format.
+ * Accepts E.164 format (+country code + number) or synthetic 555 numbers.
+ * @param {string} phone
+ * @returns {boolean}
+ */
+export function isValidPhone(phone) {
+  if (!phone || typeof phone !== 'string') return false;
+  return /^\+[1-9]\d{6,14}$/.test(phone);
+}
+
+/**
+ * Validate trust level.
+ * @param {string} trust
+ * @returns {boolean}
+ */
+export function isValidTrust(trust) {
+  return TRUST_LEVELS.includes(trust);
+}
+
+// ── Atomic File Operations ───────────────────────────────────────
+
+// ── Lock Management ──────────────────────────────────────────────
+
+/**
+ * Acquire a directory-based lock.
+ * @param {string} lockPath
+ * @param {number} [timeoutMs=5000]
+ * @returns {{ release: () => void }}
+ */
+function acquireLock(lockPath, timeoutMs = 5000) {
+  const start = Date.now();
+  while (true) {
+    try {
+      mkdirSync(lockPath, { recursive: false, mode: 0o700 });
+      return {
+        release() {
+          try { rmSync(lockPath, { recursive: true }); } catch { /* best effort */ }
+        }
+      };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      if (Date.now() - start > timeoutMs) {
+        // Check for stale lock (older than 60s)
+        try {
+          const stat = statSync(lockPath);
+          if (Date.now() - stat.mtimeMs > 60000) {
+            rmSync(lockPath, { recursive: true });
+            continue;
+          }
+        } catch { /* lock disappeared, retry */ continue; }
+        throw new Error(`Lock timeout: ${lockPath}. Another provisioner may be running.`);
+      }
+      // Non-busy sleep via Atomics.wait
+      const sab = new SharedArrayBuffer(4);
+      const int32 = new Int32Array(sab);
+      Atomics.wait(int32, 0, 0, 100);
+    }
+  }
+}
+
+// ── Registry Management ──────────────────────────────────────────
+
+/**
+ * Load the buddy registry.
+ * @returns {{ version: string, bots: object[], createdAt: string, updatedAt: string }}
+ */
+export function loadRegistry() {
+  const data = readJsonSafe(REGISTRY_FILE);
+  if (data && Array.isArray(data.bots)) return data;
+  return {
+    version: VERSION,
+    bots: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Save the buddy registry atomically.
+ * @param {object} registry
+ */
+function saveRegistry(registry) {
+  registry.updatedAt = new Date().toISOString();
+  atomicWrite(REGISTRY_FILE, JSON.stringify(registry, null, 2));
+}
+
+/**
+ * Find a bot entry in the registry.
+ * @param {object} registry
+ * @param {string} agentId
+ * @returns {object|undefined}
+ */
+function findBot(registry, agentId) {
+  return registry.bots.find(b => b.agentId === agentId);
+}
+
+// ── Peer Management ──────────────────────────────────────────────
+
+/**
+ * Load the comms-guard peers list.
+ * @returns {{ peers: object[] }}
+ */
+function loadPeers() {
+  const data = readJsonSafe(PEERS_FILE);
+  if (data && Array.isArray(data.peers)) return data;
+  return { peers: [] };
+}
+
+/**
+ * Save the comms-guard peers list atomically.
+ * @param {object} peersData
+ */
+function savePeers(peersData) {
+  atomicWrite(PEERS_FILE, JSON.stringify(peersData, null, 2));
+}
+
+/**
+ * Register a peer in comms-guard.
+ * @param {string} agentId
+ * @param {string} xmtpAddress
+ * @param {string} trust
+ */
+function registerPeer(agentId, xmtpAddress, trust) {
+  const lock = acquireLock(join(REGISTRY_DIR, '.peers.lock'));
+  try {
+    const peersData = loadPeers();
+    const existing = peersData.peers.findIndex(p => p.agentId === agentId);
+    const entry = {
+      agentId,
+      xmtpAddress,
+      trust,
+      registeredAt: new Date().toISOString(),
+      status: 'active'
+    };
+    if (existing >= 0) {
+      peersData.peers[existing] = entry;
+    } else {
+      peersData.peers.push(entry);
+    }
+    savePeers(peersData);
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Unregister a peer from comms-guard.
+ * @param {string} agentId
+ */
+function unregisterPeer(agentId) {
+  const lock = acquireLock(join(REGISTRY_DIR, '.peers.lock'));
+  try {
+    const peersData = loadPeers();
+    peersData.peers = peersData.peers.filter(p => p.agentId !== agentId);
+    savePeers(peersData);
+  } finally {
+    lock.release();
+  }
+}
+
+// ── Template Rendering ───────────────────────────────────────────
+
+/**
+ * Render a template file with variable substitution.
+ * Replaces [placeholder text] patterns with actual values.
+ * @param {string} templatePath
+ * @param {object} vars — { name, phone, trust, agentId, xmtpAddress }
+ * @returns {string}
+ */
+export function renderTemplate(templatePath, vars) {
+  if (!existsSync(templatePath)) {
+    throw new Error(`Template not found: ${templatePath}`);
+  }
+  let content = readFileSync(templatePath, 'utf8');
+
+  // Replace known placeholders
+  content = content.replace(/\[Human's name — filled at provisioning\]/g, vars.name || '[Not set]');
+  content = content.replace(/\[Human's phone — filled at provisioning\]/g, vars.phone || '[Not set]');
+  content = content.replace(/\[personal \/ business \/ public — filled at provisioning\]/g, vars.trust || 'public');
+  content = content.replace(/\[Connected calendars — filled when human grants access\]/g, 'Not yet connected');
+  content = content.replace(/\[Learned over time[^\]]*\]/g, '');
+  content = content.replace(/\[Buddy bot fills this in[^\]]*\]/g, '');
+
+  return content;
+}
+
+// ── Workspace Creation ───────────────────────────────────────────
+
+/**
+ * Create an isolated workspace for a buddy bot.
+ * @param {string} agentId
+ * @param {object} vars — Template variables
+ * @returns {{ workspaceDir: string }}
+ */
+export function createWorkspace(agentId, vars) {
+  const workspaceDir = join(WORKSPACE_BASE, `buddy-${agentId}`);
+
+  // Safety: verify workspaceDir is under WORKSPACE_BASE
+  const resolved = resolve(workspaceDir);
+  if (!resolved.startsWith(resolve(WORKSPACE_BASE) + sep)) {
+    throw new Error(`Workspace path escape detected: ${resolved}`);
+  }
+
+  if (existsSync(workspaceDir)) {
+    throw new Error(`Workspace already exists: ${workspaceDir}. Use --remove first or --force.`);
+  }
+
+  // Create workspace with strict permissions
+  mkdirSync(workspaceDir, { recursive: true, mode: 0o700 });
+  mkdirSync(join(workspaceDir, 'memory'), { mode: 0o700 });
+
+  // Render and write templates
+  const templates = ['SOUL.md', 'USER.md', 'AGENTS.md'];
+  for (const tmpl of templates) {
+    const templatePath = join(TEMPLATES_DIR, tmpl);
+    if (existsSync(templatePath)) {
+      const rendered = renderTemplate(templatePath, vars);
+      writeFileSync(join(workspaceDir, tmpl), rendered, { encoding: 'utf8', mode: 0o600 });
+    }
+  }
+
+  // Create empty workspace files
+  for (const file of ['MEMORY.md', 'TOOLS.md', 'HEARTBEAT.md', 'IDENTITY.md']) {
+    writeFileSync(join(workspaceDir, file), '', { encoding: 'utf8', mode: 0o600 });
+  }
+
+  // Set directory permissions (ensure 700 after file creation)
+  chmodSync(workspaceDir, 0o700);
+
+  return { workspaceDir };
+}
+
+// ── OpenClaw Config Injection ────────────────────────────────────
+
+/**
+ * Inject a buddy bot agent entry into openclaw.json.
+ * @param {string} agentId
+ * @param {string} workspaceDir
+ * @param {object} [opts]
+ * @returns {{ configPath: string, injected: boolean }}
+ */
+export function injectAgentConfig(agentId, workspaceDir, opts = {}) {
+  const configPath = opts.configPath || OPENCLAW_CONFIG;
+
+  if (!existsSync(configPath)) {
+    return { configPath, injected: false };
+  }
+
+  const lock = acquireLock(join(dirname(configPath), '.openclaw.lock'));
+  try {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+
+    // Ensure agents.entries exists
+    if (!config.agents) config.agents = {};
+    if (!config.agents.entries) config.agents.entries = {};
+
+    const entryKey = `buddy-${agentId}`;
+
+    // Don't overwrite existing entries unless forced
+    if (config.agents.entries[entryKey] && !opts.force) {
+      return { configPath, injected: false };
+    }
+
+    config.agents.entries[entryKey] = {
+      label: `Buddy Bot: ${opts.name || agentId}`,
+      workspace: workspaceDir,
+      model: {
+        primary: opts.model || 'ollama/gemma4-26b-q3',
+        fallbacks: ['mor-gateway/kimi-k2.5']
+      },
+      timeoutSeconds: 300,
+      heartbeat: {
+        enabled: true,
+        intervalMs: 1800000  // 30 minutes
+      }
+    };
+
+    atomicWrite(configPath, JSON.stringify(config, null, 2));
+    return { configPath, injected: true };
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Remove a buddy bot agent entry from openclaw.json.
+ * @param {string} agentId
+ * @param {object} [opts]
+ * @returns {{ removed: boolean }}
+ */
+export function removeAgentConfig(agentId, opts = {}) {
+  const configPath = opts.configPath || OPENCLAW_CONFIG;
+
+  if (!existsSync(configPath)) return { removed: false };
+
+  const lock = acquireLock(join(dirname(configPath), '.openclaw.lock'));
+  try {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    const entryKey = `buddy-${agentId}`;
+
+    if (config.agents?.entries?.[entryKey]) {
+      delete config.agents.entries[entryKey];
+      atomicWrite(configPath, JSON.stringify(config, null, 2));
+      return { removed: true };
+    }
+    return { removed: false };
+  } finally {
+    lock.release();
+  }
+}
+
+// ── Daemon Service Management ────────────────────────────────────
+
+/**
+ * Create a per-agent daemon service definition.
+ * macOS: launchd plist. Linux: systemd unit.
+ * @param {string} agentId
+ * @param {object} opts
+ * @returns {{ servicePath: string, serviceType: string }}
+ */
+export function createDaemonService(agentId, opts = {}) {
+  const os = platform();
+
+  if (os === 'darwin') {
+    return createLaunchdService(agentId, opts);
+  } else if (os === 'linux') {
+    return createSystemdService(agentId, opts);
+  } else {
+    return { servicePath: '', serviceType: 'unsupported' };
+  }
+}
+
+/**
+ * Create a launchd plist for macOS.
+ * @param {string} agentId
+ * @param {object} opts
+ * @returns {{ servicePath: string, serviceType: string }}
+ */
+function createLaunchdService(agentId, opts = {}) {
+  const label = `ai.buddybots.agent.${agentId}`;
+  const plistDir = join(HOME, 'Library', 'LaunchAgents');
+  const plistPath = join(plistDir, `${label}.plist`);
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${process.execPath}</string>
+    <string>${join(REPO_ROOT, 'scripts', 'buddy-chat.mjs')}</string>
+    <string>--agent-id</string>
+    <string>${agentId}</string>
+    <string>--daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${join(EVERCLAW_DIR, 'logs', `buddy-${agentId}.log`)}</string>
+  <key>StandardErrorPath</key>
+  <string>${join(EVERCLAW_DIR, 'logs', `buddy-${agentId}.err`)}</string>
+</dict>
+</plist>`;
+
+  mkdirSync(plistDir, { recursive: true });
+  mkdirSync(join(EVERCLAW_DIR, 'logs'), { recursive: true });
+  writeFileSync(plistPath, plist, { encoding: 'utf8' });
+
+  return { servicePath: plistPath, serviceType: 'launchd' };
+}
+
+/**
+ * Create a systemd user unit for Linux.
+ * @param {string} agentId
+ * @param {object} opts
+ * @returns {{ servicePath: string, serviceType: string }}
+ */
+function createSystemdService(agentId, opts = {}) {
+  const unitName = `buddy-${agentId}`;
+  const unitDir = join(HOME, '.config', 'systemd', 'user');
+  const unitPath = join(unitDir, `${unitName}.service`);
+
+  const unit = `[Unit]
+Description=Buddy Bot Agent: ${agentId}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${process.execPath} ${join(REPO_ROOT, 'scripts', 'buddy-chat.mjs')} --agent-id ${agentId} --daemon
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${unitName}
+
+[Install]
+WantedBy=default.target
+`;
+
+  mkdirSync(unitDir, { recursive: true });
+  writeFileSync(unitPath, unit, { encoding: 'utf8' });
+
+  return { servicePath: unitPath, serviceType: 'systemd' };
+}
+
+/**
+ * Remove a daemon service for an agent.
+ * @param {string} agentId
+ * @returns {{ removed: boolean }}
+ */
+function removeDaemonService(agentId) {
+  const os = platform();
+  let servicePath;
+
+  if (os === 'darwin') {
+    const label = `ai.buddybots.agent.${agentId}`;
+    servicePath = join(HOME, 'Library', 'LaunchAgents', `${label}.plist`);
+    // Unload if loaded
+    try { execSync(`launchctl bootout gui/$(id -u) ${servicePath} 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
+  } else if (os === 'linux') {
+    servicePath = join(HOME, '.config', 'systemd', 'user', `buddy-${agentId}.service`);
+    try { execSync(`systemctl --user stop buddy-${agentId} 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
+    try { execSync(`systemctl --user disable buddy-${agentId} 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
+  }
+
+  if (servicePath && existsSync(servicePath)) {
+    rmSync(servicePath);
+    return { removed: true };
+  }
+  return { removed: false };
+}
+
+// ── OpenClaw Reload ──────────────────────────────────────────────
+
+/**
+ * Send SIGUSR1 to OpenClaw gateway to hot-reload config.
+ * @returns {{ reloaded: boolean, pid: number|null }}
+ */
+export function reloadOpenClaw() {
+  try {
+    const pidFile = join(OPENCLAW_DIR, 'gateway.pid');
+    if (!existsSync(pidFile)) return { reloaded: false, pid: null };
+
+    const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+    if (isNaN(pid) || pid <= 0) return { reloaded: false, pid: null };
+
+    process.kill(pid, 'SIGUSR1');
+    return { reloaded: true, pid };
+  } catch (err) {
+    if (err.code === 'ESRCH') return { reloaded: false, pid: null };
+    throw err;
+  }
+}
+
+// ── Main Provisioning ────────────────────────────────────────────
+
+/**
+ * Provision a new buddy bot.
+ * @param {object} opts
+ * @param {string} opts.name — Human-readable name
+ * @param {string} opts.phone — Phone number (E.164)
+ * @param {string} opts.trust — Trust level
+ * @param {string} [opts.agentId] — Override agent ID (default: derived from name)
+ * @param {boolean} [opts.force] — Overwrite existing
+ * @param {string} [opts.model] — Model override
+ * @param {string} [opts.configPath] — openclaw.json override
+ * @param {string} [opts.baseDir] — EVERCLAW_DIR override
+ * @returns {Promise<object>} Provisioning result
+ */
+export async function provisionBot(opts) {
+  const { name, phone, trust, force = false, model } = opts;
+
+  // Validate inputs
+  if (!name) throw new Error('--name is required.');
+  if (!phone) throw new Error('--phone is required.');
+  if (!trust) throw new Error('--trust is required.');
+  if (!isValidPhone(phone)) throw new Error(`Invalid phone format: "${phone}". Use E.164 format (+1234567890).`);
+  if (!isValidTrust(trust)) throw new Error(`Invalid trust level: "${trust}". Valid: ${TRUST_LEVELS.join(', ')}`);
+
+  const agentId = opts.agentId || nameToAgentId(name);
+
+  // Pre-check registry (advisory — final check under lock at Step 5)
+  const registry0 = loadRegistry();
+  const existing0 = findBot(registry0, agentId);
+  if (existing0 && !force) {
+    throw new Error(`Bot "${agentId}" already exists. Use --force to overwrite or --remove first.`);
+  }
+
+  const result = {
+    agentId,
+    name,
+    phone,
+    trust,
+    steps: {}
+  };
+
+  // Step 1: Create workspace
+  try {
+    if (force) {
+      const workspaceDir = join(WORKSPACE_BASE, `buddy-${agentId}`);
+      if (existsSync(workspaceDir)) rmSync(workspaceDir, { recursive: true });
+    }
+    const { workspaceDir } = createWorkspace(agentId, { name, phone, trust });
+    result.workspaceDir = workspaceDir;
+    result.steps.workspace = 'created';
+  } catch (err) {
+    result.steps.workspace = `failed: ${err.message}`;
+    throw err;
+  }
+
+  // Step 2: Generate XMTP identity
+  try {
+    const baseDir = opts.baseDir || EVERCLAW_DIR;
+    if (force && hasIdentity(agentId, baseDir)) {
+      removeIdentity(agentId, { baseDir });
+    }
+    const identity = await generateIdentity(agentId, { baseDir });
+    result.xmtpAddress = identity.address;
+    result.steps.identity = 'generated';
+  } catch (err) {
+    result.steps.identity = `failed: ${err.message}`;
+    throw err;
+  }
+
+  // Step 3: Inject agent config
+  try {
+    const { injected } = injectAgentConfig(agentId, result.workspaceDir, {
+      name, model, force, configPath: opts.configPath
+    });
+    result.steps.config = injected ? 'injected' : 'skipped (no openclaw.json or entry exists)';
+  } catch (err) {
+    result.steps.config = `failed: ${err.message}`;
+    // Non-fatal — continue
+  }
+
+  // Step 4: Create daemon service
+  try {
+    const { servicePath, serviceType } = createDaemonService(agentId);
+    result.servicePath = servicePath;
+    result.serviceType = serviceType;
+    result.steps.daemon = serviceType === 'unsupported' ? 'skipped (unsupported OS)' : 'created';
+  } catch (err) {
+    result.steps.daemon = `failed: ${err.message}`;
+    // Non-fatal — continue
+  }
+
+  // Step 5: Update registry (with final race-condition guard)
+  const regLock = acquireLock(join(REGISTRY_DIR, '.registry.lock'));
+  let registry;
+  try {
+    registry = loadRegistry();
+    const existingIdx = registry.bots.findIndex(b => b.agentId === agentId);
+    // Final race-condition check under lock
+    if (existingIdx >= 0 && !force) {
+      // Rollback workspace + identity
+      try { rmSync(result.workspaceDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      try { removeIdentity(agentId, { baseDir: opts.baseDir || EVERCLAW_DIR }); } catch { /* best effort */ }
+      throw new Error(`Bot "${agentId}" was provisioned by another process (race condition).`);
+    }
+    const entry = {
+      agentId,
+      name,
+      phone: createHash('sha256').update(phone).digest('hex').slice(0, 16), // Hash, never store raw
+      trust,
+      xmtpAddress: result.xmtpAddress,
+      workspaceDir: result.workspaceDir,
+      provisionedAt: new Date().toISOString(),
+      status: 'active'
+    };
+    if (existingIdx >= 0) {
+      registry.bots[existingIdx] = entry;
+    } else {
+      registry.bots.push(entry);
+    }
+    saveRegistry(registry);
+    result.steps.registry = 'updated';
+  } catch (err) {
+    result.steps.registry = `failed: ${err.message}`;
+  } finally {
+    regLock.release();
+  }
+
+  // Step 6: Register peer in comms-guard
+  try {
+    registerPeer(agentId, result.xmtpAddress, trust);
+    result.steps.peer = 'registered';
+  } catch (err) {
+    result.steps.peer = `failed: ${err.message}`;
+  }
+
+  // Step 7: Reload OpenClaw
+  try {
+    const { reloaded, pid } = reloadOpenClaw();
+    result.steps.reload = reloaded ? `sent SIGUSR1 to pid ${pid}` : 'skipped (gateway not running)';
+  } catch (err) {
+    result.steps.reload = `failed: ${err.message}`;
+  }
+
+  // Step 8: Welcome DM placeholder (actual DM requires running gateway)
+  result.steps.welcome = 'queued (sent on first agent heartbeat)';
+
   return result;
 }
 
-/**
- * Read and parse openclaw.json. Returns the parsed config object.
- */
-function readOpenClawConfig(configPath = OPENCLAW_CONFIG) {
-  if (!existsSync(configPath)) {
-    throw new Error(`OpenClaw config not found: ${configPath}`);
-  }
-  return JSON.parse(readFileSync(configPath, 'utf8'));
-}
+// ── Remove Bot ───────────────────────────────────────────────────
 
 /**
- * Write openclaw.json atomically.
- */
-function writeOpenClawConfig(config, configPath = OPENCLAW_CONFIG) {
-  const tmp = configPath + '.tmp.' + randomUUID().slice(0, 8);
-  writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
-  renameSync(tmp, configPath);
-}
-
-/**
- * Atomically write peers.json (mirrors writeOpenClawConfig pattern).
- */
-function writePeers(peers, peersPath = join(EVERCLAW_DIR, 'xmtp', 'peers.json')) {
-  const dir = dirname(peersPath);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmp = peersPath + '.tmp.' + randomUUID().slice(0, 8);
-  writeFileSync(tmp, JSON.stringify(peers, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
-  renameSync(tmp, peersPath);
-}
-
-/**
- * Remove peer entry by agentId (DRY helper used by rollback + deprovision).
- */
-function removePeerByAgentId(agentId, peersPath = join(EVERCLAW_DIR, 'xmtp', 'peers.json')) {
-  if (!existsSync(peersPath)) return false;
-  let peers;
-  try {
-    peers = JSON.parse(readFileSync(peersPath, 'utf8'));
-  } catch (e) {
-    throw new Error(`Corrupt peers.json: ${e.message}`);
-  }
-  let removed = false;
-  if (peers.trusted) {
-    for (const [addr, info] of Object.entries(peers.trusted)) {
-      if (info && info.agentId === agentId) {
-        delete peers.trusted[addr];
-        removed = true;
-      }
-    }
-  }
-  if (removed) {
-    writePeers(peers, peersPath);
-    return true;
-  }
-  return false;
-}
-
-/**
- * Send SIGUSR1 to the OpenClaw gateway process to reload config.
- */
-function reloadOpenClaw() {
-  const pidFile = join(OPENCLAW_DIR, '.gateway.pid');
-  if (existsSync(pidFile)) {
-    try {
-      const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-      if (!isNaN(pid) && pid > 0) {
-        process.kill(pid, 'SIGUSR1');
-        return true;
-      }
-    } catch {}
-  }
-  // Fallback: try pkill (non-fatal)
-  try {
-    execFileSync('pkill', ['-USR1', '-f', 'openclaw.*gateway'], { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// ── Provisioning Steps ───────────────────────────────────────────
-
-/**
- * Step 1: Create workspace with templated files.
- */
-function createWorkspace(agentId, vars) {
-  const wsPath = getWorkspacePath(agentId);
-
-  if (existsSync(wsPath)) {
-    throw new Error(`Workspace already exists: ${wsPath}. Use --remove ${agentId} first.`);
-  }
-
-  mkdirSync(wsPath, { recursive: true, mode: 0o700 });
-  mkdirSync(join(wsPath, 'memory'), { mode: 0o700 });
-
-  // Template files
-  const templateFiles = ['SOUL.md', 'USER.md', 'AGENTS.md'];
-  for (const file of templateFiles) {
-    const templatePath = join(TEMPLATES_DIR, file);
-    if (existsSync(templatePath)) {
-      const content = interpolate(readFileSync(templatePath, 'utf8'), vars);
-      writeFileSync(join(wsPath, file), content, { encoding: 'utf8', mode: 0o600 });
-    }
-  }
-
-  // Create empty MEMORY.md
-  writeFileSync(join(wsPath, 'MEMORY.md'), `# MEMORY.md — ${vars.NAME}'s Buddy Bot\n\nLast updated: ${vars.DATE}\n\n---\n\nNew buddy bot. No memories yet.\n`, { encoding: 'utf8', mode: 0o600 });
-
-  return wsPath;
-}
-
-/**
- * Step 2: Generate XMTP identity by calling setup-identity.mjs.
- * Returns the XMTP address from the identity file.
- */
-function generateXmtpIdentity(agentId) {
-  try {
-    execFileSync('node', [SETUP_IDENTITY, '--agent-id', agentId], {
-      stdio: 'pipe',
-      cwd: dirname(SETUP_IDENTITY),
-      timeout: 30_000
-    });
-  } catch (err) {
-    const stderr = err.stderr ? err.stderr.toString() : '';
-    const stdout = err.stdout ? err.stdout.toString() : '';
-    throw new Error(`XMTP identity generation failed: ${stderr || stdout || err.message}`);
-  }
-
-  // Read the generated identity
-  const identityPath = join(EVERCLAW_DIR, `xmtp-${agentId}`, 'identity.json');
-  if (!existsSync(identityPath)) {
-    throw new Error(`XMTP identity file not found after generation: ${identityPath}`);
-  }
-  const identity = JSON.parse(readFileSync(identityPath, 'utf8'));
-  return identity.address;
-}
-
-/**
- * Step 3: Inject agent entry into openclaw.json.
- */
-function injectAgent(agentId, name, wsPath, configPath = OPENCLAW_CONFIG) {
-  const config = readOpenClawConfig(configPath);
-
-  if (!config.agents) config.agents = {};
-  if (!config.agents.list) config.agents.list = [];
-
-  // Check for duplicate
-  const existing = config.agents.list.find(a => a.id === agentId);
-  if (existing) {
-    throw new Error(`Agent '${agentId}' already exists in openclaw.json`);
-  }
-
-  const agentEntry = {
-    id: agentId,
-    name: `${name}'s Buddy Bot`,
-    workspace: wsPath,
-    model: { ...BUDDY_MODEL_CONFIG }
-  };
-
-  config.agents.list.push(agentEntry);
-  writeOpenClawConfig(config, configPath);
-  return agentEntry;
-}
-
-/**
- * Step 4: Update buddy registry.
- */
-function updateRegistry(phone, name, xmtpAddress, agentId, trustProfile, registryPath) {
-  return addBuddy({
-    phone,
-    name,
-    xmtpAddress,
-    agentId,
-    trustProfile,
-    hostAgentId: 'buddy-host',
-    registryPath
-  });
-}
-
-/**
- * Step 5: Register peer in comms-guard peers.json.
- */
-function registerPeer(agentId, xmtpAddress) {
-  const peersPath = join(EVERCLAW_DIR, 'xmtp', 'peers.json');
-  let peers = {};
-
-  if (existsSync(peersPath)) {
-    try {
-      peers = JSON.parse(readFileSync(peersPath, 'utf8'));
-    } catch { /* start fresh if corrupt */ }
-  }
-
-  if (!peers.trusted) peers.trusted = {};
-
-  peers.trusted[xmtpAddress] = {
-    agentId,
-    addedAt: new Date().toISOString(),
-    addedBy: 'buddy-provision',
-    autoTrusted: true
-  };
-
-  writePeers(peers, peersPath);
-}
-
-// ── Rollback ─────────────────────────────────────────────────────
-
-/**
- * Undo partial provisioning on failure.
- */
-function rollback(agentId, steps, { configPath, registryPath } = {}) {
-  const errors = [];
-
-  if (steps.includes('workspace')) {
-    try {
-      const wsPath = getWorkspacePath(agentId);
-      if (existsSync(wsPath)) rmSync(wsPath, { recursive: true, force: true });
-    } catch (e) { errors.push(`workspace cleanup: ${e.message}`); }
-  }
-
-  if (steps.includes('xmtp')) {
-    try {
-      const xmtpDir = join(EVERCLAW_DIR, `xmtp-${agentId}`);
-      if (existsSync(xmtpDir)) rmSync(xmtpDir, { recursive: true, force: true });
-    } catch (e) { errors.push(`xmtp cleanup: ${e.message}`); }
-  }
-
-  if (steps.includes('config')) {
-    try {
-      const path = configPath || OPENCLAW_CONFIG;
-      const config = readOpenClawConfig(path);
-      config.agents.list = config.agents.list.filter(a => a.id !== agentId);
-      writeOpenClawConfig(config, path);
-    } catch (e) { errors.push(`config cleanup: ${e.message}`); }
-  }
-
-  if (steps.includes('registry')) {
-    try {
-      const entry = lookupByAgentId(agentId, registryPath);
-      if (entry && entry.phone) {
-        registryRemoveBuddy(entry.phone, registryPath);
-      }
-    } catch (e) { errors.push(`registry cleanup: ${e.message}`); }
-  }
-
-  if (steps.includes('peers')) {
-    try {
-      removePeerByAgentId(agentId);
-    } catch (e) { errors.push(`peers cleanup: ${e.message}`); }
-  }
-
-  // Reload OpenClaw to pick up the removals
-  try {
-    reloadOpenClaw();
-  } catch { /* non-fatal */ }
-
-  return errors;
-}
-
-// ── Main Provision ───────────────────────────────────────────────
-
-/**
- * Provision a new buddy bot. Performs all 6 steps with rollback on failure.
- *
- * @param {object} opts
- * @param {string} opts.name - Human's name
- * @param {string} opts.phone - Phone number
- * @param {string} [opts.trustProfile='personal'] - Trust profile
- * @param {string} [opts.agentId] - Override derived agent ID
- * @param {boolean} [opts.dryRun=false] - Print plan without executing
- * @param {string} [opts.configPath] - Override openclaw.json path
- * @param {string} [opts.registryPath] - Override buddy registry path
- * @returns {object} Provision result with all details
- */
-export function provision(opts) {
-  const { name, phone, trustProfile = 'personal', dryRun = false, configPath, registryPath } = opts;
-
-  // Validation
-  if (!name || typeof name !== 'string') throw new Error('--name is required');
-  if (!phone || typeof phone !== 'string') throw new Error('--phone is required');
-  if (!VALID_TRUST_PROFILES.includes(trustProfile)) {
-    throw new Error(`--trust must be one of: ${VALID_TRUST_PROFILES.join(', ')}`);
-  }
-
-  const agentId = opts.agentId || deriveAgentId(name);
-  const wsPath = getWorkspacePath(agentId);
-
-  // Check for conflicts before doing anything
-  if (existsSync(wsPath)) {
-    throw new Error(`Workspace already exists: ${wsPath}. Use --remove ${agentId} first.`);
-  }
-
-  const existingByPhone = lookupByPhone(phone, registryPath);
-  if (existingByPhone) {
-    throw new Error(`Phone ${phone} already registered to agent '${existingByPhone.agentId}'`);
-  }
-
-  const existingByAgent = lookupByAgentId(agentId, registryPath);
-  if (existingByAgent) {
-    throw new Error(`Agent ID '${agentId}' already registered to phone ${existingByAgent.phone}`);
-  }
-
-  const plan = {
-    agentId,
-    name,
-    phone,
-    trustProfile,
-    workspace: wsPath,
-    xmtpDir: join(EVERCLAW_DIR, `xmtp-${agentId}`),
-    steps: [
-      '1. Create workspace with templated SOUL/USER/AGENTS',
-      '2. Generate XMTP identity',
-      '3. Inject agent into openclaw.json',
-      '4. Update buddy registry',
-      '5. Register peer in comms-guard',
-      '6. Reload OpenClaw (SIGUSR1)'
-    ]
-  };
-
-  if (dryRun) {
-    return { dryRun: true, ...plan };
-  }
-
-  // Execute steps with rollback tracking
-  const completedSteps = [];
-  const templateVars = {
-    NAME: name,
-    PHONE: phone,
-    TRUST_PROFILE: trustProfile,
-    AGENT_ID: agentId,
-    DATE: new Date().toISOString().split('T')[0]
-  };
-
-  try {
-    // Step 1: Create workspace
-    createWorkspace(agentId, templateVars);
-    completedSteps.push('workspace');
-
-    // Step 2: Generate XMTP identity
-    const xmtpAddress = generateXmtpIdentity(agentId);
-    completedSteps.push('xmtp');
-
-    // Step 3: Inject into openclaw.json
-    const agentEntry = injectAgent(agentId, name, wsPath, configPath);
-    completedSteps.push('config');
-
-    // Step 4: Update buddy registry
-    const registryEntry = updateRegistry(phone, name, xmtpAddress, agentId, trustProfile, registryPath);
-    completedSteps.push('registry');
-
-    // Step 5: Register comms-guard peer
-    registerPeer(agentId, xmtpAddress);
-    completedSteps.push('peers');
-
-    // Step 6: Reload OpenClaw
-    const reloaded = reloadOpenClaw();
-
-    return {
-      success: true,
-      agentId,
-      name,
-      phone,
-      trustProfile,
-      workspace: wsPath,
-      xmtpAddress,
-      reloaded,
-      registryEntry,
-      agentEntry
-    };
-  } catch (err) {
-    // Rollback completed steps
-    const rollbackErrors = rollback(agentId, completedSteps, { configPath, registryPath });
-    const msg = `Provisioning failed at step ${completedSteps.length + 1}: ${err.message}`;
-    if (rollbackErrors.length > 0) {
-      throw new Error(`${msg}\nRollback errors: ${rollbackErrors.join('; ')}`);
-    }
-    throw new Error(`${msg} (rolled back ${completedSteps.length} steps)`);
-  }
-}
-
-// ── Remove ───────────────────────────────────────────────────────
-
-/**
- * Remove a provisioned buddy bot. Undoes all provisioning steps.
- *
- * @param {string} agentId - Agent ID to remove
- * @param {object} [opts] - Options
- * @param {string} [opts.configPath] - Override openclaw.json path
- * @param {string} [opts.registryPath] - Override buddy registry path
+ * Remove a buddy bot completely.
+ * @param {string} agentId
+ * @param {object} [opts]
  * @returns {object} Removal result
  */
-export function deprovision(agentId, opts = {}) {
-  const { configPath, registryPath } = opts;
-
-  if (!agentId || typeof agentId !== 'string') {
-    throw new Error('Agent ID is required for removal');
+export function removeBot(agentId, opts = {}) {
+  if (!isValidAgentId(agentId)) {
+    throw new Error(`Invalid agent ID: "${agentId}"`);
   }
 
-  const results = {
-    agentId,
-    removed: [],
-    errors: []
-  };
+  const result = { agentId, steps: {} };
 
-  // 1. Remove from buddy registry (by agentId lookup → get phone → remove)
+  // Remove workspace
+  const workspaceDir = join(WORKSPACE_BASE, `buddy-${agentId}`);
+  if (existsSync(workspaceDir)) {
+    rmSync(workspaceDir, { recursive: true });
+    result.steps.workspace = 'removed';
+  } else {
+    result.steps.workspace = 'not found';
+  }
+
+  // Remove identity
+  const baseDir = opts.baseDir || EVERCLAW_DIR;
+  if (hasIdentity(agentId, baseDir)) {
+    removeIdentity(agentId, { baseDir });
+    result.steps.identity = 'removed';
+  } else {
+    result.steps.identity = 'not found';
+  }
+
+  // Remove agent config
+  const { removed: configRemoved } = removeAgentConfig(agentId, { configPath: opts.configPath });
+  result.steps.config = configRemoved ? 'removed' : 'not found';
+
+  // Remove daemon service
+  const { removed: daemonRemoved } = removeDaemonService(agentId);
+  result.steps.daemon = daemonRemoved ? 'removed' : 'not found';
+
+  // Update registry
+  const lock = acquireLock(join(REGISTRY_DIR, '.registry.lock'));
   try {
-    const entry = lookupByAgentId(agentId, registryPath);
-    if (entry) {
-      registryRemoveBuddy(entry.phone, registryPath);
-      results.removed.push('registry');
-    }
-  } catch (e) { results.errors.push(`registry: ${e.message}`); }
+    const registry = loadRegistry();
+    const before = registry.bots.length;
+    registry.bots = registry.bots.filter(b => b.agentId !== agentId);
+    saveRegistry(registry);
+    result.steps.registry = before > registry.bots.length ? 'removed' : 'not found';
+  } finally {
+    lock.release();
+  }
 
-  // 2. Remove from openclaw.json
+  // Unregister peer
   try {
-    const path = configPath || OPENCLAW_CONFIG;
-    if (existsSync(path)) {
-      const config = readOpenClawConfig(path);
-      const before = config.agents?.list?.length || 0;
-      if (config.agents?.list) {
-        config.agents.list = config.agents.list.filter(a => a.id !== agentId);
-      }
-      if ((config.agents?.list?.length || 0) < before) {
-        writeOpenClawConfig(config, path);
-        results.removed.push('config');
-      }
-    }
-  } catch (e) { results.errors.push(`config: ${e.message}`); }
+    unregisterPeer(agentId);
+    result.steps.peer = 'unregistered';
+  } catch {
+    result.steps.peer = 'not found';
+  }
 
-  // 3. Remove from comms-guard peers
+  // Reload OpenClaw
   try {
-    if (removePeerByAgentId(agentId)) {
-      results.removed.push('peers');
-    }
-  } catch (e) { results.errors.push(`peers: ${e.message}`); }
+    const { reloaded } = reloadOpenClaw();
+    result.steps.reload = reloaded ? 'sent SIGUSR1' : 'skipped';
+  } catch {
+    result.steps.reload = 'failed';
+  }
 
-  // 4. Remove XMTP identity directory
-  try {
-    const xmtpDir = join(EVERCLAW_DIR, `xmtp-${agentId}`);
-    if (existsSync(xmtpDir)) {
-      rmSync(xmtpDir, { recursive: true, force: true });
-      results.removed.push('xmtp');
-    }
-  } catch (e) { results.errors.push(`xmtp: ${e.message}`); }
-
-  // 5. Remove workspace
-  try {
-    const wsPath = getWorkspacePath(agentId);
-    if (existsSync(wsPath)) {
-      rmSync(wsPath, { recursive: true, force: true });
-      results.removed.push('workspace');
-    }
-  } catch (e) { results.errors.push(`workspace: ${e.message}`); }
-
-  // 6. Reload OpenClaw
-  results.reloaded = reloadOpenClaw();
-
-  return results;
+  return result;
 }
 
 // ── CLI ──────────────────────────────────────────────────────────
 
+/**
+ * Parse CLI arguments.
+ * @param {string[]} argv
+ * @returns {object}
+ */
 function parseArgs(argv) {
-  const args = {};
+  const args = {
+    name: null,
+    phone: null,
+    trust: null,
+    agentId: null,
+    force: false,
+    model: null,
+    status: false,
+    list: false,
+    remove: false,
+    help: false,
+    json: false,
+    configPath: null,
+    baseDir: null
+  };
+
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--name' && argv[i + 1]) args.name = argv[++i];
-    else if (arg === '--phone' && argv[i + 1]) args.phone = argv[++i];
-    else if (arg === '--trust' && argv[i + 1]) args.trustProfile = argv[++i];
-    else if (arg === '--agent-id' && argv[i + 1]) args.agentId = argv[++i];
-    else if (arg === '--remove' && argv[i + 1]) args.remove = argv[++i];
-    else if (arg === '--config' && argv[i + 1]) args.configPath = argv[++i];
-    else if (arg === '--registry' && argv[i + 1]) args.registryPath = argv[++i];
-    else if (arg === '--dry-run') args.dryRun = true;
-    else if (arg === '--status') args.status = true;
-    else if (arg === '--list') args.list = true;
-    else if (arg === '--help' || arg === '-h') args.help = true;
+    switch (arg) {
+      case '--name': args.name = argv[++i]; break;
+      case '--phone': args.phone = argv[++i]; break;
+      case '--trust': args.trust = argv[++i]; break;
+      case '--agent-id': args.agentId = argv[++i]; break;
+      case '--model': args.model = argv[++i]; break;
+      case '--config-path': args.configPath = argv[++i]; break;
+      case '--base-dir': args.baseDir = argv[++i]; break;
+      case '--force': args.force = true; break;
+      case '--status': args.status = true; break;
+      case '--list': args.list = true; break;
+      case '--remove': args.remove = true; break;
+      case '--json': args.json = true; break;
+      case '--help': case '-h': args.help = true; break;
+      default:
+        if (arg.startsWith('--')) {
+          console.error(`Unknown option: ${arg}`);
+          process.exit(1);
+        }
+    }
   }
   return args;
 }
 
+/**
+ * Show help text.
+ */
 function showHelp() {
   console.log(`
-🤝 Buddy Bot Provisioner
+🤝 Buddy Bot Provisioner v${VERSION}
 
 Usage:
-  buddy-provision --name <n> --phone <p> [--trust <t>] [--agent-id <id>] [--dry-run]
-  buddy-provision --remove <agent-id>
-  buddy-provision --status
-  buddy-provision --list
+  buddy-provision --name <name> --phone <phone> --trust <level>   Provision a new bot
+  buddy-provision --status                                         Show provisioner status
+  buddy-provision --list                                           List provisioned bots
+  buddy-provision --remove --agent-id <id>                        Remove a bot
+  buddy-provision --help                                          Show this help
 
-Provision options:
-  --name <name>       Human's name (local only, never on-chain)
-  --phone <phone>     Phone number or user ID
-  --trust <profile>   Trust profile: public, business, personal, financial, full (default: personal)
-  --agent-id <id>     Override auto-derived agent ID
-  --dry-run           Print plan without executing
+Options:
+  --name <name>         Human's name (local only, never on-chain)
+  --phone <phone>       Phone number (E.164 format, e.g. +15555551234)
+  --trust <level>       Trust level: public, business, personal, financial, full
+  --agent-id <id>       Override auto-derived agent ID
+  --model <model>       Model override (default: ollama/gemma4-26b-q3)
+  --force               Overwrite existing bot
+  --json                Output as JSON
+  --config-path <path>  Override openclaw.json path
+  --base-dir <path>     Override ~/.everclaw base directory
 
-Management:
-  --remove <id>       Remove a provisioned buddy bot (cleans up everything)
-  --status            Show provisioner status and buddy count
-  --list              List all provisioned buddy bots
+Trust Levels:
+  public       General info only (anyone)
+  business     Calendar availability, professional recommendations
+  personal     Preferences, availability, suggestions (trusted buddies)
+  financial    Financial coordination (restricted)
+  full         Full access (maximum trust)
 
-Advanced:
-  --config <path>     Override openclaw.json path
-  --registry <path>   Override buddy registry path
-  --help              Show this help
-  `);
+Examples:
+  buddy-provision --name "Alice" --phone "+15555551234" --trust personal
+  buddy-provision --remove --agent-id alice
+  buddy-provision --list --json
+`);
 }
 
+/**
+ * CLI: Show provisioner status.
+ */
 function cmdStatus(args) {
-  const buddies = listBuddies(args.registryPath);
-  console.log('🤝 Buddy Bots Provisioner');
-  console.log(`   Provisioned bots: ${buddies.length}`);
-  console.log(`   Registry: ${args.registryPath || '~/.everclaw/buddy-registry.json'}`);
-  console.log(`   Config: ${args.configPath || '~/.openclaw/openclaw.json'}`);
-  if (buddies.length > 0) {
-    console.log(`   Active: ${buddies.filter(b => b.status === 'active').length}`);
+  const registry = loadRegistry();
+  const activeCount = registry.bots.filter(b => b.status === 'active').length;
+
+  if (args.json) {
+    console.log(JSON.stringify({
+      version: VERSION,
+      totalBots: registry.bots.length,
+      activeBots: activeCount,
+      registryPath: REGISTRY_FILE,
+      workspaceBase: WORKSPACE_BASE,
+      updatedAt: registry.updatedAt
+    }, null, 2));
+    return;
   }
+
+  console.log(`🤝 Buddy Bots Provisioner v${VERSION}`);
+  console.log(`   Total bots:    ${registry.bots.length}`);
+  console.log(`   Active bots:   ${activeCount}`);
+  console.log(`   Registry:      ${REGISTRY_FILE}`);
+  console.log(`   Workspaces:    ${WORKSPACE_BASE}`);
+  console.log(`   Last updated:  ${registry.updatedAt || 'never'}`);
 }
 
+/**
+ * CLI: List all provisioned bots.
+ */
 function cmdList(args) {
-  const buddies = listBuddies(args.registryPath);
-  if (buddies.length === 0) {
+  const registry = loadRegistry();
+
+  if (args.json) {
+    console.log(JSON.stringify(registry.bots, null, 2));
+    return;
+  }
+
+  if (registry.bots.length === 0) {
     console.log('No buddy bots provisioned yet.');
-    return;
-  }
-  console.log(`🤝 ${buddies.length} buddy bot(s):\n`);
-  for (const b of buddies) {
-    console.log(`  ${b.agentId} — ${b.name} (${b.phone})`);
-    console.log(`    Trust: ${b.trustProfile} | Status: ${b.status} | XMTP: ${b.xmtpAddress?.slice(0, 10)}...`);
-  }
-}
-
-function cmdProvision(args) {
-  const result = provision(args);
-
-  if (result.dryRun) {
-    console.log('🧪 DRY RUN — no changes made\n');
-    console.log(`  Agent ID:     ${result.agentId}`);
-    console.log(`  Name:         ${result.name}`);
-    console.log(`  Phone:        ${result.phone}`);
-    console.log(`  Trust:        ${result.trustProfile}`);
-    console.log(`  Workspace:    ${result.workspace}`);
-    console.log(`  XMTP dir:     ${result.xmtpDir}`);
-    console.log(`\n  Steps:`);
-    for (const step of result.steps) {
-      console.log(`    ${step}`);
-    }
+    console.log('Run: buddy-provision --name "Name" --phone "+1..." --trust personal');
     return;
   }
 
-  console.log(`✅ Buddy bot provisioned!\n`);
-  console.log(`  Agent ID:     ${result.agentId}`);
-  console.log(`  Name:         ${result.name}`);
-  console.log(`  Phone:        ${result.phone}`);
-  console.log(`  Trust:        ${result.trustProfile}`);
-  console.log(`  XMTP Address: ${result.xmtpAddress}`);
-  console.log(`  Workspace:    ${result.workspace}`);
-  console.log(`  Reloaded:     ${result.reloaded ? 'yes' : 'no (manual SIGUSR1 needed)'}`);
+  console.log(`🤝 ${registry.bots.length} buddy bot(s):\n`);
+  for (const bot of registry.bots) {
+    const icon = bot.status === 'active' ? '🟢' : '⚫';
+    console.log(`  ${icon} ${bot.agentId}`);
+    console.log(`     Name:    ${bot.name}`);
+    console.log(`     Trust:   ${bot.trust}`);
+    console.log(`     XMTP:    ${bot.xmtpAddress || 'not set'}`);
+    console.log(`     Since:   ${bot.provisionedAt}`);
+    console.log('');
+  }
 }
 
-function cmdRemove(args) {
-  const result = deprovision(args.remove, {
+/**
+ * CLI: Provision a new bot.
+ */
+async function cmdProvision(args) {
+  console.log(`🤝 Provisioning buddy bot for "${args.name}"...\n`);
+
+  const result = await provisionBot({
+    name: args.name,
+    phone: args.phone,
+    trust: args.trust,
+    agentId: args.agentId,
+    force: args.force,
+    model: args.model,
     configPath: args.configPath,
-    registryPath: args.registryPath
+    baseDir: args.baseDir
   });
 
-  if (result.removed.length === 0 && result.errors.length === 0) {
-    console.log(`⚠️  Agent '${args.remove}' not found in any registry.`);
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
 
-  console.log(`🗑️  Removed buddy bot '${args.remove}':\n`);
-  for (const step of result.removed) {
-    console.log(`  ✅ ${step}`);
+  console.log(`✅ Buddy bot "${result.agentId}" provisioned!\n`);
+  console.log(`   Name:       ${result.name}`);
+  console.log(`   Phone:      ${result.phone}`);
+  console.log(`   Trust:      ${result.trust}`);
+  console.log(`   XMTP:       ${result.xmtpAddress}`);
+  console.log(`   Workspace:  ${result.workspaceDir}`);
+  console.log('');
+  console.log('   Steps:');
+  for (const [step, status] of Object.entries(result.steps)) {
+    const icon = status.startsWith('failed') ? '❌' : '✅';
+    console.log(`     ${icon} ${step}: ${status}`);
   }
-  for (const err of result.errors) {
-    console.log(`  ❌ ${err}`);
+  console.log('');
+}
+
+/**
+ * CLI: Remove a bot.
+ */
+function cmdRemove(args) {
+  if (!args.agentId) {
+    console.error('❌ --agent-id is required for --remove.');
+    process.exit(1);
   }
-  console.log(`\n  Reloaded: ${result.reloaded ? 'yes' : 'no'}`);
+
+  console.log(`🗑️  Removing buddy bot "${args.agentId}"...\n`);
+
+  const result = removeBot(args.agentId, {
+    configPath: args.configPath,
+    baseDir: args.baseDir
+  });
+
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(`✅ Buddy bot "${result.agentId}" removed.\n`);
+  for (const [step, status] of Object.entries(result.steps)) {
+    const icon = status === 'not found' ? '⚪' : '✅';
+    console.log(`   ${icon} ${step}: ${status}`);
+  }
+  console.log('');
 }
 
 // ── Entry Point ──────────────────────────────────────────────────
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.help) { showHelp(); return; }
   if (args.status) { cmdStatus(args); return; }
   if (args.list) { cmdList(args); return; }
   if (args.remove) { cmdRemove(args); return; }
-  if (args.name && args.phone) { cmdProvision(args); return; }
 
-  console.error('❌ Missing required arguments. Run with --help for usage.');
-  process.exit(1);
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  try {
-    main();
-  } catch (err) {
-    console.error(`❌ ${err.message}`);
+  // Default: provision
+  if (!args.name) {
+    console.error('❌ --name is required. Run --help for usage.');
     process.exit(1);
   }
+
+  await cmdProvision(args);
+}
+
+// Run CLI when executed directly
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch(err => {
+    console.error(`❌ ${err.message}`);
+    process.exit(1);
+  });
 }
