@@ -92,6 +92,13 @@ function LoginInner() {
     }
   }, [ready, authenticated, sent, getAccessToken]);
 
+  // Auto-trigger Privy login when ready and not yet authenticated
+  useEffect(() => {
+    if (ready && !authenticated && !sent) {
+      login();
+    }
+  }, [ready, authenticated, sent, login]);
+
   if (!ready) {
     return (
       <div className="loading">
@@ -110,6 +117,7 @@ function LoginInner() {
     );
   }
 
+  // Fallback button in case auto-trigger doesn't fire (e.g., popup blocked)
   return (
     <div style={{ textAlign: 'center' }}>
       <button
