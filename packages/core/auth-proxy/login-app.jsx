@@ -154,7 +154,15 @@ function App() {
       appId={PRIVY_APP_ID}
       {...(PRIVY_CLIENT_ID ? { clientId: PRIVY_CLIENT_ID } : {})}
       config={{
-        loginMethods: ['google', 'email', 'apple'],
+        loginMethods: ['wallet', 'google', 'email', 'apple'],
+        externalWallets: {
+          ethereum: {
+            connectors: ['metaMask', 'walletConnect', 'coinbaseWallet', 'rainbow', 'injected'],
+          },
+          solana: {
+            connectors: ['phantom', 'solflare', 'backpack'],
+          },
+        },
         appearance: {
           theme: 'dark',
           accentColor: '#7c3aed',
