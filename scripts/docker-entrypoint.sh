@@ -274,6 +274,41 @@ if jq . "$CONFIG_FILE" > /dev/null 2>&1; then
   fi
 fi
 
+# ─── CIG Mode: Route inference through auth-proxy ────────────────────────────
+# When CIG (Central Inference Gateway) env vars are set, the auth-proxy intercepts
+# /v1/chat/completions and routes through the CIG, which holds the master Morpheus key.
+# We redirect mor-gateway's baseUrl to localhost:18789 (auth-proxy) instead of the
+# external Morpheus API. The auth-proxy mints CIG tokens using the binding_secret.
+#
+# CIG env vars (required for CIG mode):
+#   CIG_MINT_URL        → mint-cig-token endpoint URL (required)
+#   CIG_BINDING_SECRET  → Per-container binding secret (required)
+#   CIG_INFERENCE_URL   → cig-inference endpoint URL (required)
+#   CIG_CONTAINER_FQDN  → This container's public FQDN (used by auth-proxy, not checked here)
+
+CIG_ENABLED=false
+if [ -n "${CIG_MINT_URL:-}" ] && [ -n "${CIG_BINDING_SECRET:-}" ] && [ -n "${CIG_INFERENCE_URL:-}" ]; then
+  CIG_ENABLED=true
+  echo "🔐 CIG mode detected — routing inference through auth-proxy"
+fi
+
+if [ "$CIG_ENABLED" = "true" ] && jq . "$CONFIG_FILE" > /dev/null 2>&1; then
+  # In CIG mode, redirect mor-gateway to localhost:18789 (auth-proxy)
+  # The auth-proxy intercepts /v1/chat/completions and handles CIG token minting
+  TMP_CONFIG=$(mktemp)
+  if jq '
+    .models.providers["mor-gateway"].baseUrl = "http://localhost:18789/v1" |
+    .models.providers["mor-gateway"].apiKey = "cig-proxy-mode"
+  ' "$CONFIG_FILE" > "$TMP_CONFIG"; then
+    mv "$TMP_CONFIG" "$CONFIG_FILE"
+    echo "   mor-gateway baseUrl → http://localhost:18789/v1 (auth-proxy intercept)"
+    echo "   CIG will mint tokens using binding_secret and forward to Morpheus"
+  else
+    rm -f "$TMP_CONFIG"
+    echo "⚠️  Failed to configure CIG mode for mor-gateway"
+  fi
+fi
+
 # ─── API Key Injection: Morpheus Gateway + morpheus-local ────────────────────
 # mor-gateway is a custom provider not in OpenClaw's PROVIDER_ENV_API_KEY_CANDIDATES,
 # so env vars won't be auto-detected. We inject them into the config directly.
@@ -281,12 +316,14 @@ fi
 # Supported env vars:
 #   MORPHEUS_GATEWAY_API_KEY  → mor-gateway provider apiKey (Morpheus API Gateway)
 #   MORPHEUS_PROXY_API_KEY    → morpheus-local provider apiKey (local proxy-router)
+#
+# Note: In CIG mode, these are ignored — CIG routing takes precedence.
 
 if jq . "$CONFIG_FILE" > /dev/null 2>&1; then
   API_KEY_CHANGES=false
 
-  # Morpheus API Gateway key (mor-gateway provider)
-  if [ -n "${MORPHEUS_GATEWAY_API_KEY:-}" ]; then
+  # Morpheus API Gateway key (mor-gateway provider) — skip if CIG mode
+  if [ -n "${MORPHEUS_GATEWAY_API_KEY:-}" ] && [ "$CIG_ENABLED" != "true" ]; then
     TMP_CONFIG=$(mktemp)
     if jq --arg key "$MORPHEUS_GATEWAY_API_KEY" '
       .models.providers["mor-gateway"].apiKey = $key
@@ -315,8 +352,8 @@ if jq . "$CONFIG_FILE" > /dev/null 2>&1; then
     fi
   fi
 
-  # Warn if no AI provider keys are configured at all
-  if [ "$API_KEY_CHANGES" = "false" ]; then
+  # Warn if no AI provider keys are configured at all (skip warning if CIG mode)
+  if [ "$API_KEY_CHANGES" = "false" ] && [ "$CIG_ENABLED" != "true" ]; then
     MG_KEY=$(jq -r '.models.providers["mor-gateway"].apiKey // empty' "$CONFIG_FILE" 2>/dev/null)
     ML_KEY=$(jq -r '.models.providers["morpheus-local"].apiKey // empty' "$CONFIG_FILE" 2>/dev/null)
     if [ -z "$MG_KEY" ] && [ -z "$ML_KEY" ]; then
