@@ -67,6 +67,10 @@ const CONFIG = {
   verifyOwnerUrl: process.env.VERIFY_OWNER_URL || '',
   verifyOwnerSecret: process.env.VERIFY_OWNER_SECRET || '',
   containerFqdn: process.env.CONTAINER_FQDN || '',
+  // SSO handoff: dedicated secret for HS256 JWT verification (separate from verify-owner)
+  handoffSigningSecret: process.env.HANDOFF_SIGNING_SECRET || '',
+  // Consume-handoff endpoint (Supabase Edge Function) for DB-backed single-use enforcement
+  consumeHandoffUrl: process.env.CONSUME_HANDOFF_URL || '',
   // Login-page branding (set by provisioner; lobster is the OpenClaw default)
   brandName: process.env.BRAND_NAME || 'OpenClaw',
   brandIcon: process.env.BRAND_ICON || '🦞',
@@ -182,6 +186,60 @@ function validateConfig() {
   } else {
     console.log(`   Mode:   STATIC (env var owner)`);
     console.log(`   Owner:  ${CONFIG.ownerPrivyId}`);
+  }
+  if (CONFIG.handoffSigningSecret) {
+    console.log(`   SSO:    ENABLED (handoff token bridge)`);
+  } else {
+    console.log(`   SSO:    DISABLED (set HANDOFF_SIGNING_SECRET to enable)`);
+  }
+}
+
+// ─── SSO Handoff: Single-Use Token Tracking ──────────────────────────────────
+// Two-layer replay prevention:
+// 1. In-memory Map<jti, timestamp> — instant check, pruned every 90s via setInterval
+// 2. Supabase handoff_tokens table — survives process restarts (consumed_at column)
+// The DB check is authoritative; in-memory is a fast-path optimization.
+const consumedHandoffTokens = new Map();
+const HANDOFF_TOKEN_TTL_MS = 90_000; // 90 seconds (matches JWT TTL)
+
+// Prune expired entries every 30 seconds to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [jti, ts] of consumedHandoffTokens) {
+    if (now - ts > HANDOFF_TOKEN_TTL_MS) {
+      consumedHandoffTokens.delete(jti);
+    }
+  }
+}, 30_000).unref();
+
+// Supabase Edge Function helper for handoff token consumption (no service key in container)
+// Calls consume-handoff-token function with VERIFY_OWNER_SECRET for auth.
+// Returns { consumed: true } if token was valid and not previously consumed.
+async function dbConsumeHandoffToken(jti) {
+  if (!CONFIG.consumeHandoffUrl) return { consumed: true }; // Fallback: in-memory only
+  try {
+    const resp = await fetch(CONFIG.consumeHandoffUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CONFIG.verifyOwnerSecret}`,
+      },
+      body: JSON.stringify({ jti }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (resp.status === 409) {
+      // Already consumed
+      return { consumed: false, error: 'already_consumed' };
+    }
+    if (!resp.ok) {
+      console.error(`[handoff] consume-handoff returned ${resp.status}`);
+      return { consumed: false, error: 'db_error' };
+    }
+    const result = await resp.json();
+    return { consumed: !!result.consumed };
+  } catch (err) {
+    console.error(`[handoff] consume-handoff error: ${err.message}`);
+    return { consumed: false, error: 'db_unavailable' };
   }
 }
 
@@ -736,6 +794,160 @@ async function handleRequest(req, res) {
   // These are internal requests (no session cookie needed).
   if (CIG_ENABLED && pathname.startsWith('/v1/') && req.method === 'POST') {
     await handleCigProxy(req, res, url);
+    return;
+  }
+
+  // ── SSO Handoff — exchange single-use JWT for session cookie ──
+  // Receives a short-lived HS256 JWT via POST body (form-urlencoded).
+  // Validates JWT signature, expiry, FQDN match, and single-use (in-memory consumed set).
+  // On success: sets session cookie and 302 redirects to /.
+  // On failure: serves login page (fallback to current behavior).
+  if (pathname === '/auth/handoff' && req.method === 'POST') {
+    // SSO disabled — don't waste rate-limit slots or attempt JWT verify with empty key
+    if (!CONFIG.handoffSigningSecret) {
+      serveLoginPage(res, 404);
+      return;
+    }
+
+    // Rate limit: 5 attempts per minute per IP (shared AUTH_RATE_LIMIT)
+    const handoffIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    if (isRateLimited(handoffIp)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+      res.end(JSON.stringify({ error: 'rate_limited', retryAfter: 60 }));
+      return;
+    }
+
+    try {
+      // Parse form-urlencoded body (auto-submitting HTML form)
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of req) {
+        size += chunk.length;
+        if (size > MAX_BODY_BYTES) {
+          req.destroy();
+          throw new Error('Body too large');
+        }
+        chunks.push(chunk);
+      }
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      const params = new URLSearchParams(rawBody);
+      const token = params.get('token');
+
+      if (!token || typeof token !== 'string') {
+        console.log('[handoff] No token in POST body');
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Verify HS256 JWT using HANDOFF_SIGNING_SECRET
+      let handoffPayload;
+      try {
+        const secretKey = new TextEncoder().encode(CONFIG.handoffSigningSecret);
+        const { payload } = await jwtVerify(token, secretKey, {
+          algorithms: ['HS256'],
+        });
+        handoffPayload = payload;
+      } catch (jwtErr) {
+        console.log(`[handoff] JWT verification failed: ${jwtErr.code || jwtErr.message}`);
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Validate required claims
+      const { sub, fqdn: tokenFqdn, jti } = handoffPayload;
+      if (!sub || !tokenFqdn || !jti) {
+        console.log('[handoff] Missing required claims (sub, fqdn, jti)');
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Single-use enforcement: check in-memory Map first (fast path only — don't consume yet)
+      if (consumedHandoffTokens.has(jti)) {
+        console.log(`[handoff] Token already consumed (in-memory): jti=${jti}`);
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Validate FQDN: token must match this container's FQDN
+      const containerFqdn = (CONFIG.containerFqdn || req.headers.host || '').split(':')[0].toLowerCase();
+      const expectedFqdn = containerFqdn;
+      const tokenFqdnLower = String(tokenFqdn).toLowerCase();
+
+      if (tokenFqdnLower !== expectedFqdn) {
+        console.log(`[handoff] FQDN mismatch: token=${tokenFqdnLower} expected=${expectedFqdn}`);
+        serveLoginPage(res, 403);
+        return;
+      }
+
+      // Defense-in-depth: verify ownership via Supabase (same as /auth/callback)
+      if (DYNAMIC_OWNER_MODE) {
+        try {
+          const verifyResp = await fetch(CONFIG.verifyOwnerUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${CONFIG.verifyOwnerSecret}`,
+            },
+            body: JSON.stringify({
+              fqdn: expectedFqdn,
+              privy_user_id: sub,
+            }),
+            signal: AbortSignal.timeout(5000),
+          });
+
+          if (!verifyResp.ok) {
+            console.log(`[handoff] verify-owner returned ${verifyResp.status}`);
+            serveLoginPage(res, 403);
+            return;
+          }
+
+          const result = await verifyResp.json();
+          if (!result.authorized) {
+            console.log(`[handoff] Owner check failed: sub=${sub} fqdn=${expectedFqdn}`);
+            serveLoginPage(res, 403);
+            return;
+          }
+        } catch (fetchErr) {
+          console.error(`[handoff] verify-owner error: ${fetchErr.message}`);
+          serveLoginPage(res, 403);
+          return;
+        }
+      }
+
+      // All validations passed — NOW consume the token (DB-backed atomic single-use)
+      const dbResult = await dbConsumeHandoffToken(jti);
+      if (!dbResult.consumed) {
+        // DB says already consumed or unavailable — fail closed
+        console.log(`[handoff] Token rejected by DB: jti=${jti} reason=${dbResult.error}`);
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Mark token as consumed in-memory
+      consumedHandoffTokens.set(jti, Date.now());
+
+      // Create signed session cookie (same as /auth/callback)
+      const sessionValue = signSession(sub);
+      const cookieOpts = getCookieOptions(req);
+
+      console.log(`[handoff] ✓ SSO handoff successful: sub=${sub} fqdn=${expectedFqdn} jti=${jti}`);
+
+      res.writeHead(302, {
+        'Set-Cookie': cookie.serialize(COOKIE_NAME, sessionValue, cookieOpts),
+        'Location': '/',
+      });
+      res.end();
+      return;
+    } catch (error) {
+      console.error('[handoff] Error:', error.message);
+      serveLoginPage(res, 500);
+      return;
+    }
+  }
+
+  // ── GET /auth/handoff without POST → serve login page ──
+  if (pathname === '/auth/handoff' && req.method === 'GET') {
+    serveLoginPage(res);
     return;
   }
 

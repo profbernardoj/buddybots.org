@@ -2,6 +2,26 @@
 
 All notable changes to EverClaw are documented here.
 
+## [2026.6.18.1803] - 2026-06-18
+
+### SSO Session Bridge (Single Sign-In)
+
+- **packages/core/auth-proxy/server.mjs:** Added `POST /auth/handoff` route for SSO session bridge. Accepts short-lived HS256 JWT via form-urlencoded POST body, verifies signature with dedicated `HANDOFF_SIGNING_SECRET`, validates FQDN match, calls `consume-handoff-token` Edge Function for DB-backed atomic single-use enforcement, verifies ownership via `verify-owner`, then sets session cookie and 302 redirects to `/`. Falls back to login page on any error. SSO auto-disables if `HANDOFF_SIGNING_SECRET` not set.
+- **supabase/functions/generate-handoff-token/index.ts:** New Edge Function. Verifies Privy JWT, validates deployment ownership, cleans up expired tokens, dedup check with unique partial index handling, generates 90s TTL HS256 JWT with JTI, stores in `handoff_tokens` table.
+- **supabase/functions/consume-handoff-token/index.ts:** New Edge Function. Atomic single-use consumption via `UPDATE WHERE consumed_at IS NULL AND expires_at > now()`. Returns 409 on already-consumed. Authenticated via `VERIFY_OWNER_SECRET`.
+- **supabase/migrations/20260618_handoff_tokens.sql:** New table with `jti` PK, `privy_user_id`, `fqdn`, `consumed_at`, `expires_at`. Unique partial index on `(privy_user_id, fqdn) WHERE consumed_at IS NULL` prevents concurrent active tokens. RLS enabled.
+- **supabase/functions/provision-buffer/index.ts:** Passes `HANDOFF_SIGNING_SECRET` and `CONSUME_HANDOFF_URL` env vars to container manifest.
+- **supabase/functions/deploy-agent/index.ts:** Same env var passthrough for cold deploy path.
+
+### Security
+
+- Dedicated `HANDOFF_SIGNING_SECRET` for HS256 JWT signing (separate from `VERIFY_OWNER_SECRET`)
+- 90-second TTL on handoff tokens (immediate handoff expected)
+- Single-use enforcement: in-memory Map (fast path) + DB atomic consume (survives restarts)
+- FQDN binding prevents token reuse across containers
+- Defense-in-depth: `verify-owner` call on success path
+- POST body delivery (not URL query param) prevents token leakage in browser history/referer
+
 ## [2026.5.28.1854] - 2026-05-28
 
 ### OpenClaw Pin Bump v2026.5.22 → v2026.5.27
