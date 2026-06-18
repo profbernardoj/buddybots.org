@@ -2,6 +2,14 @@
 
 All notable changes to EverClaw are documented here.
 
+## [2026.6.18.2214] - 2026-06-18
+
+### Bug Fixes — Update Banner + CIG Model Prefix
+
+- **Dockerfile:** Bumped `OPENCLAW_VERSION` from `v2026.5.27` → `v2026.6.8`. Resolves stale "Update available" banner on InstallOpenClaw.xyz containers.
+- **config/openclaw-default.json:** Added `update.checkOnStart: false`. Suppresses the in-app "Update Now" button that fails with `checkout-failed` on Docker containers (containers are immutable images and cannot self-update via git checkout).
+- **supabase/functions/cig-inference/index.ts:** Strip provider prefix from model name before tier check. OpenClaw sends `mor-gateway/deepseek-v4-flash` but CIG's free-tier allowlist and Morpheus API expect bare `deepseek-v4-flash`. Without stripping, the first check fails, triggers a downgrade retry, and the initial response shows "assistant turn failed before producing content". Fix uses `lastIndexOf("/")` with empty fallback to `"default"`.
+
 ## [2026.6.18.1803] - 2026-06-18
 
 ### SSO Session Bridge (Single Sign-In)

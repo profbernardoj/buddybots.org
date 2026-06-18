@@ -50,7 +50,7 @@
 
 # ─── Stage 1: Build OpenClaw ─────────────────────────────────────────────────
 
-ARG OPENCLAW_VERSION=v2026.5.27
+ARG OPENCLAW_VERSION=v2026.6.8
 
 FROM node:22-bookworm AS openclaw-builder
 
