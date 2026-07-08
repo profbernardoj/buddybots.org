@@ -736,7 +736,10 @@ export async function provisionBot(opts) {
 }
 
 /** Alias for provisionBot — used by tests and buddy-host.
- *  Sync for dry-run (no async ops needed), async for real provisioning. */
+ *  Returns sync object for dry-run (tests depend on sync access), Promise<object> otherwise.
+ *  @param {object} opts - Same opts as provisionBot + dryRun
+ *  @returns {object|Promise<object>} Sync result for dryRun, Promise for real provisioning
+ */
 export function provision(opts) {
   // Dry-run is fully synchronous — no async operations needed
   if (opts.dryRun) {
@@ -855,13 +858,17 @@ export function deprovision(agentId, opts = {}) {
 
   const result = { removed: [], errors: [] };
 
-  /** Try a removal step; push to removed on success, errors on failure, ignore on skip. */
-  function tryStep(name, fn) {
+  /** Try a removal step; push to removed on success, errors on failure.
+   *  @param {string} name - Step name
+   *  @param {Function} fn - Returns truthy if step performed an action
+   *  @param {boolean} [silent=false] - If true, swallow errors (for optional steps like peer/reload)
+   */
+  function tryStep(name, fn, silent = false) {
     try {
       const did = fn();
       if (did) result.removed.push(name);
     } catch (e) {
-      result.errors.push(`${name}: ${e.message}`);
+      if (!silent) result.errors.push(`${name}: ${e.message}`);
     }
   }
 
@@ -883,7 +890,7 @@ export function deprovision(agentId, opts = {}) {
 
   // Remove from internal provision registry (REGISTRY_DIR)
   // Silently skip if REGISTRY_DIR doesn't exist (test environments)
-  try {
+  tryStep('internal-registry', () => {
     const lock = acquireLock(join(REGISTRY_DIR, '.registry.lock'));
     try {
       const registry = loadRegistry();
@@ -891,14 +898,13 @@ export function deprovision(agentId, opts = {}) {
       registry.bots = registry.bots.filter(b => b.agentId !== agentId);
       if (before > registry.bots.length) {
         saveRegistry(registry);
-        if (!result.removed.includes('registry')) result.removed.push('registry');
+        return true;
       }
+      return false;
     } finally {
       lock.release();
     }
-  } catch {
-    // Internal registry may not exist in test environments
-  }
+  }, /* silent */ true);
 
   // Remove workspace (path validated by isValidAgentId above)
   tryStep('workspace', () => {
@@ -920,29 +926,23 @@ export function deprovision(agentId, opts = {}) {
     return false;
   });
 
-  // Remove daemon service
-  try {
+  // Remove daemon service (may not exist in test environments)
+  tryStep('daemon', () => {
     const { removed: daemonRemoved } = removeDaemonService(agentId);
-    if (daemonRemoved) result.removed.push('daemon');
-  } catch {
-    // Daemon may not exist
-  }
+    return daemonRemoved;
+  }, /* silent */ true);
 
-  // Unregister peer
-  try {
+  // Unregister peer (may not exist)
+  tryStep('peer', () => {
     unregisterPeer(agentId);
-    result.removed.push('peer');
-  } catch {
-    // Peer may not exist
-  }
+    return true;
+  }, /* silent */ true);
 
-  // Reload OpenClaw
-  try {
+  // Reload OpenClaw (may fail in test environments)
+  tryStep('reload', () => {
     const { reloaded } = reloadOpenClaw();
-    if (reloaded) result.removed.push('reload');
-  } catch {
-    // Reload may fail in test environments
-  }
+    return reloaded;
+  }, /* silent */ true);
 
   return result;
 }
