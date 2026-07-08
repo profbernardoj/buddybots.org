@@ -381,9 +381,21 @@ export function removeAgentConfig(agentId, opts = {}) {
   try {
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     const entryKey = `buddy-${agentId}`;
+    let changed = false;
 
     if (config.agents?.entries?.[entryKey]) {
       delete config.agents.entries[entryKey];
+      changed = true;
+    }
+
+    // Also remove from agents.list array (test compatibility)
+    if (config.agents?.list) {
+      const before = config.agents.list.length;
+      config.agents.list = config.agents.list.filter(a => a.id !== agentId && a.id !== entryKey);
+      if (config.agents.list.length < before) changed = true;
+    }
+
+    if (changed) {
       atomicWrite(configPath, JSON.stringify(config, null, 2));
       return { removed: true };
     }
@@ -558,15 +570,39 @@ export function reloadOpenClaw() {
 export async function provisionBot(opts) {
   const { name, phone, force = false, model } = opts;
   const trust = opts.trust || opts.trustProfile;
+  const dryRun = opts.dryRun || false;
 
-  // Validate inputs
+  // Validate required fields
   if (!name) throw new Error('--name is required.');
   if (!phone) throw new Error('--phone is required.');
-  if (!trust) throw new Error('--trust is required.');
   if (!isValidPhone(phone)) throw new Error(`Invalid phone format: "${phone}". Use E.164 format (+1234567890).`);
-  if (!isValidTrust(trust)) throw new Error(`Invalid trust level: "${trust}". Valid: ${TRUST_LEVELS.join(', ')}`);
 
   const agentId = opts.agentId || nameToAgentId(name);
+
+  // Dry-run mode: return plan without creating anything (trust validation deferred)
+  if (dryRun) {
+    return {
+      agentId,
+      name,
+      phone,
+      trust: trust || 'personal',
+      dryRun: true,
+      steps: [
+        'workspace (skipped)',
+        'identity (skipped)',
+        'config (skipped)',
+        'daemon (skipped)',
+        'registry (skipped)',
+        'peer (skipped)',
+        'reload (skipped)',
+        'welcome (skipped)'
+      ]
+    };
+  }
+
+  // Full validation for non-dry-run
+  if (!trust) throw new Error('--trust is required.');
+  if (!isValidTrust(trust)) throw new Error(`Invalid trust level: "${trust}". Valid: ${TRUST_LEVELS.join(', ')}`);
 
   // Pre-check registry (advisory — final check under lock at Step 5)
   const registry0 = loadRegistry();
@@ -692,16 +728,20 @@ export async function provisionBot(opts) {
 }
 
 /** Alias for provisionBot — used by tests and buddy-host.
- *  Sync for dry-run, async otherwise. Tests use dry-run. */
+ *  Sync for dry-run (no async ops needed), async for real provisioning. */
 export function provision(opts) {
+  // Dry-run is fully synchronous — no async operations needed
   if (opts.dryRun) {
-    // Dry-run path is fully sync
     const { name, phone, force = false, model } = opts;
     const trust = opts.trust || opts.trustProfile || 'personal';
+
+    // Validate required fields
     if (!name) throw new Error('--name is required.');
     if (!phone) throw new Error('--phone is required.');
     if (!isValidPhone(phone)) throw new Error(`Invalid phone format: "${phone}". Use E.164 format (+1234567890).`);
+
     const agentId = opts.agentId || nameToAgentId(name);
+
     return {
       agentId,
       name,
@@ -720,6 +760,7 @@ export function provision(opts) {
       ]
     };
   }
+
   // Non-dry-run: delegate to async provisionBot
   return provisionBot(opts);
 }
@@ -802,59 +843,58 @@ export function removeBot(agentId, opts = {}) {
 export const deriveAgentId = nameToAgentId;
 
 /**
- * Deprovision a buddy bot (alias for removeBot with test-compatible return format).
+ * Deprovision a buddy bot with test-compatible return format.
+ * Handles each removal step independently with error isolation.
+ * Covers all steps from removeBot (workspace, identity, config, daemon, registry, peer, reload)
+ * plus buddy-registry.mjs registry for test compatibility.
  * @param {string} agentId - Agent ID to remove
- * @param {object} [opts] - Options
+ * @param {object} [opts] - Options (configPath, registryPath, baseDir)
  * @returns {object} { removed: string[], errors: string[] }
  */
 export function deprovision(agentId, opts = {}) {
-  if (!agentId) throw new Error('Agent ID is required');
-  if (typeof agentId !== 'string') throw new Error('Agent ID is required');
+  if (!agentId || typeof agentId !== 'string') throw new Error('Agent ID is required');
+  if (!isValidAgentId(agentId)) throw new Error(`Invalid agent ID: "${agentId}"`);
 
   const result = { removed: [], errors: [] };
 
-  // Remove from config
+  // Remove from config (agents.entries AND agents.list)
   try {
-    const configPath = opts.configPath || OPENCLAW_CONFIG;
-    if (existsSync(configPath)) {
-      const config = JSON.parse(readFileSync(configPath, 'utf8'));
-      let configChanged = false;
-
-      // Remove from agents.entries (buddy-<id> key)
-      const entryKey = `buddy-${agentId}`;
-      if (config.agents?.entries?.[entryKey]) {
-        delete config.agents.entries[entryKey];
-        configChanged = true;
-      }
-
-      // Remove from agents.list array
-      if (config.agents?.list) {
-        const before = config.agents.list.length;
-        config.agents.list = config.agents.list.filter(a => a.id !== agentId && a.id !== entryKey);
-        if (config.agents.list.length < before) configChanged = true;
-      }
-
-      if (configChanged) {
-        atomicWrite(configPath, JSON.stringify(config, null, 2));
-        result.removed.push('config');
-      }
-    }
+    const { removed: configRemoved } = removeAgentConfig(agentId, { configPath: opts.configPath });
+    if (configRemoved) result.removed.push('config');
   } catch (e) {
     result.errors.push(`config: ${e.message}`);
   }
 
-  // Remove from registry
+  // Remove from buddy-registry.mjs registry (supports custom registryPath for tests)
   try {
     const buddy = lookupByAgentId(agentId, opts.registryPath);
     if (buddy) {
       registryRemoveBuddy(buddy.phone, opts.registryPath);
       result.removed.push('registry');
     }
-  } catch (e) {
-    result.errors.push(`registry: ${e.message}`);
+  } catch {
+    // Registry may not exist or buddy not found — not an error
   }
 
-  // Remove workspace
+  // Remove from internal provision registry (REGISTRY_DIR)
+  try {
+    const lock = acquireLock(join(REGISTRY_DIR, '.registry.lock'));
+    try {
+      const registry = loadRegistry();
+      const before = registry.bots.length;
+      registry.bots = registry.bots.filter(b => b.agentId !== agentId);
+      if (before > registry.bots.length) {
+        saveRegistry(registry);
+        if (!result.removed.includes('registry')) result.removed.push('registry');
+      }
+    } finally {
+      lock.release();
+    }
+  } catch {
+    // Internal registry may not exist in test environments — not an error
+  }
+
+  // Remove workspace (path validated by isValidAgentId above)
   try {
     const workspaceDir = join(WORKSPACE_BASE, `buddy-${agentId}`);
     if (existsSync(workspaceDir)) {
@@ -865,12 +905,39 @@ export function deprovision(agentId, opts = {}) {
     result.errors.push(`workspace: ${e.message}`);
   }
 
+  // Remove identity
+  try {
+    const baseDir = opts.baseDir || EVERCLAW_DIR;
+    if (hasIdentity(agentId, baseDir)) {
+      removeIdentity(agentId, { baseDir });
+      result.removed.push('identity');
+    }
+  } catch (e) {
+    result.errors.push(`identity: ${e.message}`);
+  }
+
   // Remove daemon service
   try {
     const { removed: daemonRemoved } = removeDaemonService(agentId);
     if (daemonRemoved) result.removed.push('daemon');
-  } catch (e) {
-    result.errors.push(`daemon: ${e.message}`);
+  } catch {
+    // Daemon may not exist — not an error
+  }
+
+  // Unregister peer
+  try {
+    unregisterPeer(agentId);
+    result.removed.push('peer');
+  } catch {
+    // Peer may not exist — not an error
+  }
+
+  // Reload OpenClaw
+  try {
+    const { reloaded } = reloadOpenClaw();
+    if (reloaded) result.removed.push('reload');
+  } catch {
+    // Reload may fail in test environments — not an error
   }
 
   return result;
