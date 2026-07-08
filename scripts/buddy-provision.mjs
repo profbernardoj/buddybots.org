@@ -40,7 +40,7 @@ import { lookupByAgentId, removeBuddy as registryRemoveBuddy } from './buddy-reg
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, '..');
-const TEMPLATES_DIR = join(REPO_ROOT, 'templates');
+const TEMPLATES_DIR = join(REPO_ROOT, 'templates', 'buddy');
 
 const HOME = homedir();
 const OPENCLAW_DIR = process.env.OPENCLAW_DIR || join(HOME, '.openclaw');
