@@ -23,11 +23,11 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, unlinkS
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { STATE_DIR, EVERCLAW_DIR } from './paths.mjs';
 
 // ── Paths ────────────────────────────────────────────────────────
 
-const EVERCLAW_DIR = join(process.env.HOME || '', '.everclaw');
-const REGISTRY_PATH = process.env.BUDDY_REGISTRY_PATH || join(EVERCLAW_DIR, 'buddy-registry.json');
+const REGISTRY_PATH = process.env.BUDDY_REGISTRY_PATH || join(STATE_DIR, 'buddy-registry.json');
 const CURRENT_VERSION = 1;
 
 // ── File Lock (simple mkdir-based, parameterized by registry path) ───
@@ -49,7 +49,9 @@ function acquireLock(registryPath = REGISTRY_PATH) {
     try {
       mkdirSync(lockPath);
       writeFileSync(join(lockPath, 'timestamp'), Date.now().toString());
-      return;
+      const ownerToken = randomUUID();
+      writeFileSync(join(lockPath, 'owner'), ownerToken, { mode: 0o600 });
+      return ownerToken;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       // Check for stale lock
@@ -74,15 +76,34 @@ function acquireLock(registryPath = REGISTRY_PATH) {
       if (Date.now() - start > LOCK_TIMEOUT_MS) {
         throw new Error(`buddy-registry: lock timeout after ${LOCK_TIMEOUT_MS}ms. Stale lock at ${lockPath}?`);
       }
-      // Busy-wait 50ms
-      const deadline = Date.now() + 50;
-      while (Date.now() < deadline) { /* spin */ }
+      // Yield instead of tight spin. Add jitter to reduce thundering herd.
+      const backoff = 20 + Math.floor(Math.random() * 40);
+      const deadline = Date.now() + backoff;
+      while (Date.now() < deadline) {
+        // brief pause; in a future async rewrite use await setTimeout
+      }
     }
   }
 }
 
-function releaseLock(registryPath = REGISTRY_PATH) {
+function releaseLock(registryPath = REGISTRY_PATH, ownerToken = null) {
   const lockPath = getLockPath(registryPath);
+  // Verify ownership before releasing — prevents accidental release of another process's lock
+  if (ownerToken) {
+    try {
+      const storedToken = readFileSync(join(lockPath, 'owner'), 'utf8').trim();
+      if (storedToken !== ownerToken) {
+        throw new Error(`buddy-registry: refusing to release lock — ownership token mismatch (expected ${ownerToken.slice(0, 8)}…, got ${storedToken.slice(0, 8)}…)`);
+      }
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        // Lock already released or never owned by us
+        return;
+      }
+      throw err;
+    }
+  }
+  try { unlinkSync(join(lockPath, 'owner')); } catch { /* ignore */ }
   try { unlinkSync(join(lockPath, 'timestamp')); } catch { /* ignore */ }
   try { rmdirSync(lockPath); } catch { /* ignore */ }
 }
@@ -100,8 +121,14 @@ export function loadRegistry(path = REGISTRY_PATH) {
     const data = JSON.parse(raw);
     if (!data.version || !data.buddies) return emptyRegistry();
     return data;
-  } catch {
-    return emptyRegistry();
+  } catch (err) {
+    // Quarantine the bad file and surface the error
+    const quarantine = path + '.corrupt.' + Date.now();
+    try { renameSync(path, quarantine); } catch { /* best effort */ }
+    throw new Error(
+      `Corrupt registry at ${path} (quarantined to ${quarantine}): ${err.message}. ` +
+      `Refusing to start with empty state.`
+    );
   }
 }
 
@@ -137,7 +164,7 @@ export function addBuddy(opts) {
   if (!xmtpAddress || typeof xmtpAddress !== 'string') throw new Error('xmtpAddress is required and must be a string');
   if (!agentId || typeof agentId !== 'string') throw new Error('agentId is required and must be a string');
 
-  acquireLock(path);
+  const lockToken = acquireLock(path);
   try {
 
   const validProfiles = ['public', 'business', 'personal', 'financial', 'full'];
@@ -176,7 +203,7 @@ export function addBuddy(opts) {
   saveRegistry(registry, path);
   return entry;
   } finally {
-    releaseLock(path);
+    releaseLock(path, lockToken);
   }
 }
 
@@ -188,7 +215,7 @@ export function addBuddy(opts) {
  */
 export function removeBuddy(phone, registryPath) {
   const path = registryPath || REGISTRY_PATH;
-  acquireLock(path);
+  const lockToken = acquireLock(path);
   try {
     const registry = loadRegistry(path);
     const entry = registry.buddies[phone];
@@ -197,7 +224,7 @@ export function removeBuddy(phone, registryPath) {
     saveRegistry(registry, path);
     return entry;
   } finally {
-    releaseLock(path);
+    releaseLock(path, lockToken);
   }
 }
 
@@ -275,7 +302,7 @@ export function importRegistry(json, registryPath) {
     throw new Error('Invalid registry format: missing buddies object');
   }
 
-  acquireLock(path);
+  const lockToken = acquireLock(path);
   try {
     const registry = loadRegistry(path);
     let added = 0;
@@ -293,7 +320,7 @@ export function importRegistry(json, registryPath) {
     saveRegistry(registry, path);
     return { added, skipped };
   } finally {
-    releaseLock(path);
+    releaseLock(path, lockToken);
   }
 }
 

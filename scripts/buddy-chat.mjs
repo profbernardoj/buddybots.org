@@ -22,6 +22,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 
 import { hasIdentity, loadIdentity, isValidAgentId, atomicWrite, readJsonSafe } from './setup-identity.mjs';
+import { STATE_DIR, EVERCLAW_DIR } from './paths.mjs';
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -30,8 +31,7 @@ const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, '..');
 
 const HOME = homedir();
-const EVERCLAW_DIR = process.env.EVERCLAW_DIR || join(HOME, '.everclaw');
-const CHAT_STORE_DIR = join(EVERCLAW_DIR, 'buddy-chats');
+const CHAT_STORE_DIR = join(STATE_DIR, 'buddy-chats');
 
 const VERSION = '1.0.0';
 const MAX_MESSAGE_LENGTH = 4096;

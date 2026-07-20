@@ -34,6 +34,7 @@ import { execSync } from 'node:child_process';
 
 import { generateIdentity, hasIdentity, loadIdentity, removeIdentity, isValidAgentId, atomicWrite, readJsonSafe } from './setup-identity.mjs';
 import { lookupByAgentId, removeBuddy as registryRemoveBuddy } from './buddy-registry.mjs';
+import { OPENCLAW_DIR, STATE_DIR, EVERCLAW_DIR } from './paths.mjs';
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -43,12 +44,10 @@ const REPO_ROOT = resolve(__dirname, '..');
 const TEMPLATES_DIR = join(REPO_ROOT, 'templates', 'buddy');
 
 const HOME = homedir();
-const OPENCLAW_DIR = process.env.OPENCLAW_DIR || join(HOME, '.openclaw');
 const OPENCLAW_CONFIG = process.env.OPENCLAW_CONFIG || join(OPENCLAW_DIR, 'openclaw.json');
-const EVERCLAW_DIR = process.env.EVERCLAW_DIR || join(HOME, '.everclaw');
 const WORKSPACE_BASE = process.env.WORKSPACE_BASE || join(OPENCLAW_DIR, 'workspaces');
 
-const REGISTRY_DIR = join(EVERCLAW_DIR, 'buddy-registry');
+const REGISTRY_DIR = join(STATE_DIR, 'buddy-registry');
 const REGISTRY_FILE = join(REGISTRY_DIR, 'registry.json');
 const PEERS_FILE = join(REGISTRY_DIR, 'peers.json');
 

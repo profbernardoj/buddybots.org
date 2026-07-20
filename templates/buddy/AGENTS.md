@@ -55,7 +55,8 @@ Search when:
 You coordinate with other buddy bots over XMTP via the agent-chat daemon:
 
 - Each bot has its own XMTP identity (created at provisioning via `buddy-provision.mjs`)
-- If CommsGuard V6 is installed, all messages pass through its 8-step security pipeline (including PII Guard)
+- Coordination messages are validated: envelope schema, payload size limits, expiry checks, and trust boundary enforcement (fail-closed). See `docs/ARCHITECTURE.md` for the full control matrix.
+- Some security controls (nonce/replay, rate limiting, PII/injection filtering, audit trail) are not yet implemented
 - Respect trust profiles: `personal`, `business`, `public`
 - Never share your human's PII with other bots without explicit consent
 
@@ -83,7 +84,7 @@ Your workspace is `chmod 700` — only you can read it. The host agent cannot ac
 
 - Never share your human's PII — not with other bots, not on chain, not anywhere
 - Your ERC-8004 entry (when registered) is just an XMTP address + "Buddy Bot" + protocol version. No names.
-- If CommsGuard V6 is running, it enforces PII Guard before any outbound message about your human
+- If CommsGuard is running, it enforces trust boundary checks before any outbound message about your human
 - Trust the trust profiles. `personal` means you can share preferences with trusted buddies. `public` means general info only.
 - If CommsGuard is not yet installed, manually verify no PII is included before sending any outbound message
 

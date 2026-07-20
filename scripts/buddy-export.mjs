@@ -23,16 +23,15 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync
          statSync, createReadStream, cpSync, readlinkSync } from 'node:fs';
 import { join, basename, dirname, resolve, sep } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
-import { execSync } from 'node:child_process';
-import { randomUUID, createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { randomUUID, createHash, createCipheriv, randomBytes, scryptSync } from 'node:crypto';
+import { OPENCLAW_DIR, STATE_DIR, EVERCLAW_DIR } from './paths.mjs';
 
 // ── Constants ────────────────────────────────────────────────────
 
 const HOME = homedir();
-const OPENCLAW_DIR = join(HOME, '.openclaw');
-const EVERCLAW_DIR = join(HOME, '.everclaw');
-const REGISTRY_PATH = join(EVERCLAW_DIR, 'buddy-registry.json');
-const PEERS_PATH = join(EVERCLAW_DIR, 'xmtp', 'peers.json');
+const REGISTRY_PATH = join(STATE_DIR, 'buddy-registry.json');
+const PEERS_PATH = join(STATE_DIR, 'xmtp', 'peers.json');
 
 const MANIFEST_VERSION = '1.0';
 const MAX_ARCHIVE_BYTES = 500 * 1024 * 1024; // 500MB safety limit
@@ -114,8 +113,14 @@ export function extractRegistryEntry(agentId, registryPath = REGISTRY_PATH) {
     const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
     const buddies = registry.buddies || [];
     return buddies.find(b => b.agentId === agentId) || null;
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    const quarantine = registryPath + '.corrupt.' + Date.now();
+    try { renameSync(registryPath, quarantine); } catch { /* best effort */ }
+    throw new Error(
+      `Corrupt registry at ${registryPath} (quarantined to ${quarantine}): ${err.message}. ` +
+      `Refusing to silently skip.`
+    );
   }
 }
 
@@ -137,8 +142,14 @@ export function extractPeerEntry(agentId, peersPath = PEERS_PATH) {
       }
     }
     return null;
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    const quarantine = peersPath + '.corrupt.' + Date.now();
+    try { renameSync(peersPath, quarantine); } catch { /* best effort */ }
+    throw new Error(
+      `Corrupt peers file at ${peersPath} (quarantined to ${quarantine}): ${err.message}. ` +
+      `Refusing to silently skip.`
+    );
   }
 }
 
@@ -221,6 +232,64 @@ function sha256File(filePath) {
   return createHash('sha256').update(data).digest('hex');
 }
 
+// ── Identity Encryption ──────────────────────────────────────────
+
+/**
+ * Recursively collect all files under a directory.
+ * Returns array of { relPath, data } tuples.
+ * @param {string} dir
+ * @param {string} [base]
+ * @returns {{ relPath: string, data: Buffer }[]}
+ */
+function collectIdentityFiles(dir, base = dir) {
+  const results = [];
+  const entries = readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isFile()) {
+      const relPath = full.slice(base.length + 1).replace(/\\/g, '/');
+      results.push({ relPath, data: readFileSync(full) });
+    } else if (entry.isDirectory()) {
+      results.push(...collectIdentityFiles(full, base));
+    }
+  }
+  return results;
+}
+
+/**
+ * Encrypt a directory of private identity material as a single AES-256-GCM blob.
+ * Packs all files into a JSON manifest { path, data(base64) }, then encrypts.
+ * Key derived from passphrase via scrypt (N=16384, r=8, p=1).
+ * Output: destDir/identity.enc = salt(16) + iv(12) + tag(16) + ciphertext
+ * @param {string} srcDir — source identity directory
+ * @param {string} destDir — destination directory for encrypted blob
+ * @param {string} passphrase — encryption passphrase
+ */
+function encryptIdentityDir(srcDir, destDir, passphrase) {
+  if (!existsSync(srcDir)) return;
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+
+  // Collect all identity files recursively
+  const files = collectIdentityFiles(srcDir);
+  if (files.length === 0) return;
+
+  // Pack into a JSON manifest
+  const manifest = files.map(f => ({ path: f.relPath, data: f.data.toString('base64') }));
+  const plaintext = Buffer.from(JSON.stringify(manifest), 'utf8');
+
+  // Derive key and encrypt
+  const salt = randomBytes(16);
+  const key = scryptSync(passphrase, salt, 32, { N: 16384, r: 8, p: 1 });
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  // Write salt + iv + tag + ciphertext as a single blob
+  const blob = Buffer.concat([salt, iv, tag, ciphertext]);
+  writeFileSync(join(destDir, 'identity.enc'), blob, { mode: 0o600 });
+}
+
 // ── Export ────────────────────────────────────────────────────────
 
 /**
@@ -230,13 +299,17 @@ function sha256File(filePath) {
  * @param {string} [outputPath] — defaults to `{agentId}-export-{timestamp}.tar.gz`
  * @param {object} [options]
  * @param {boolean} [options.dryRun=false]
- * @param {boolean} [options.noXmtp=false] — skip XMTP identity
+ * @param {boolean} [options.includeIdentity=false] — include encrypted XMTP identity (requires passphrase)
+ * @param {string} [options.passphrase=null] — passphrase for identity encryption (min 12 chars)
+ * @param {boolean} [options.includeSocialGraph=false] — include registry and peer entries
  * @param {string} [options.openclawDir] — override for testing
  * @param {string} [options.everclawDir] — override for testing
  * @returns {object} Export result
  */
 export function exportAgent(agentId, outputPath, options = {}) {
-  const { dryRun = false, noXmtp = false } = options;
+  const { dryRun = false, includeIdentity = false, passphrase = null } = options;
+  // Legacy: support old --no-xmtp by treating it as includeIdentity = false
+  if (options.noXmtp === true) { /* keep false */ }
   const paths = getAgentPaths(agentId, {
     openclawDir: options.openclawDir,
     everclawDir: options.everclawDir,
@@ -262,27 +335,25 @@ export function exportAgent(agentId, outputPath, options = {}) {
   const wsSize = dirSize(workspacePath);
   components.push({ name: 'workspace', path: workspacePath, archivePath: 'workspace', size: wsSize });
 
-  // XMTP identity (optional)
-  if (!noXmtp && existsSync(xmtpPath)) {
+  // XMTP identity (opt-in, encrypted)
+  if (includeIdentity && existsSync(xmtpPath)) {
     const xmtpSize = dirSize(xmtpPath);
     components.push({ name: 'xmtp-identity', path: xmtpPath, archivePath: 'xmtp-identity', size: xmtpSize });
-  } else if (!noXmtp) {
-    warnings.push('XMTP identity not found — skipping');
   }
 
-  // Registry entry
+  // Registry entry (social graph — opt-in)
   const registryEntry = extractRegistryEntry(agentId, registryPath);
-  if (registryEntry) {
+  if (options.includeSocialGraph && registryEntry) {
     components.push({ name: 'registry-entry', data: registryEntry });
-  } else {
+  } else if (options.includeSocialGraph) {
     warnings.push('No buddy registry entry found — skipping');
   }
 
-  // Peer entry
+  // Peer entry (social graph — opt-in)
   const peerEntry = extractPeerEntry(agentId, peersPath);
-  if (peerEntry) {
+  if (options.includeSocialGraph && peerEntry) {
     components.push({ name: 'peer-entry', data: peerEntry });
-  } else {
+  } else if (options.includeSocialGraph) {
     warnings.push('No peer entry found — skipping');
   }
 
@@ -323,19 +394,36 @@ export function exportAgent(agentId, outputPath, options = {}) {
     const wsDest = join(stagingDir, 'workspace');
     cpSync(workspacePath, wsDest, { recursive: true });
 
-    // Copy XMTP identity
-    if (!noXmtp && existsSync(xmtpPath)) {
+    // Identity is now OPT-IN and must be encrypted
+    if (includeIdentity) {
+      if (!passphrase || typeof passphrase !== 'string' || passphrase.length < 12) {
+        throw new Error(
+          'Refusing to export private identity material without a strong passphrase ' +
+          '(--passphrase, min 12 chars). Use --include-identity only when you intend to move keys.'
+        );
+      }
+      if (!existsSync(xmtpPath)) {
+        throw new Error(`--include-identity specified but identity path does not exist: ${xmtpPath}`);
+      }
+
+      console.error(
+        'WARNING: Exporting private XMTP identity material. ' +
+        'Anyone who obtains this archive and the passphrase owns the agent identity. ' +
+        'Store and transmit with extreme care.'
+      );
+
       const xmtpDest = join(stagingDir, 'xmtp-identity');
-      cpSync(xmtpPath, xmtpDest, { recursive: true });
+      // Encrypt the identity directory contents using AES-256-GCM
+      encryptIdentityDir(xmtpPath, xmtpDest, passphrase);
     }
 
-    // Write registry entry
-    if (registryEntry) {
+    // Social graph (registry + peers) — gate it or exclude by default
+    if (options.includeSocialGraph && registryEntry) {
       writeFileSync(join(stagingDir, 'registry-entry.json'), JSON.stringify(registryEntry, null, 2));
     }
 
-    // Write peer entry
-    if (peerEntry) {
+    // Same for peer-entry.json
+    if (options.includeSocialGraph && peerEntry) {
       writeFileSync(join(stagingDir, 'peer-entry.json'), JSON.stringify(peerEntry, null, 2));
     }
 
@@ -357,7 +445,9 @@ export function exportAgent(agentId, outputPath, options = {}) {
       mkdirSync(parentDir, { recursive: true });
     }
 
-    execSync(`tar -czf "${absOutput}" -C "${stagingDir}" .`, { stdio: 'pipe' });
+    execFileSync('tar', ['-czf', absOutput, '-C', stagingDir, '.'], {
+      stdio: 'pipe',
+    });
 
     const checksum = sha256File(absOutput);
 
@@ -423,7 +513,10 @@ export function importAgent(archivePath, options = {}) {
   try {
     // ── SECURITY: Validate tar contents BEFORE extraction ──
     const tarPath = resolve(archivePath);
-    const tarList = execSync(`tar -tzf "${tarPath}"`, { encoding: 'utf8' }).split('\n');
+    const tarList = execFileSync('tar', ['-tzf', tarPath], {
+      encoding: 'utf8',
+      maxBuffer: 50 * 1024 * 1024,
+    }).split('\n');
     for (const entry of tarList) {
       if (!entry) continue;
       const normalized = entry.replace(/\\/g, '/');
@@ -436,13 +529,17 @@ export function importAgent(archivePath, options = {}) {
     }
 
     try {
-      execSync(`tar -xzf "${tarPath}" -C "${extractDir}"`, { stdio: 'pipe' });
+      execFileSync('tar', ['-xzf', tarPath, '-C', extractDir], {
+        stdio: 'pipe',
+      });
     } catch (err) {
       throw new Error(`Failed to extract archive: ${err.message}`);
     }
 
     // Post-extraction defense-in-depth
-    const extracted = execSync(`find "${extractDir}" -type f -o -type l`, { encoding: 'utf8' })
+    const extracted = execFileSync('find', [extractDir, '-type', 'f', '-o', '-type', 'l'], {
+      encoding: 'utf8',
+    })
       .trim().split('\n').filter(Boolean);
     for (const entry of extracted) {
       const rel = entry.slice(extractDir.length + 1);
@@ -452,7 +549,9 @@ export function importAgent(archivePath, options = {}) {
     }
 
     // Check symlink targets don't escape the extract directory
-    const symlinks = execSync(`find "${extractDir}" -type l`, { encoding: 'utf8' })
+    const symlinks = execFileSync('find', [extractDir, '-type', 'l'], {
+      encoding: 'utf8',
+    })
       .trim().split('\n').filter(Boolean);
     for (const link of symlinks) {
       try {

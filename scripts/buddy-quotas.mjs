@@ -24,16 +24,16 @@
  * Dependencies: Node built-ins only. Optional: buddy-registry.mjs (for agent names in status).
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, renameSync, unlinkSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, renameSync, unlinkSync, statSync, rmdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
+import { STATE_DIR } from './paths.mjs';
 
 // ── Paths ────────────────────────────────────────────────────────
 
-const EVERCLAW_DIR = process.env.EVERCLAW_DIR || join(process.env.HOME || '', '.everclaw');
-const QUOTAS_DIR = process.env.BUDDY_QUOTAS_DIR || join(EVERCLAW_DIR, 'quotas');
+const QUOTAS_DIR = process.env.BUDDY_QUOTAS_DIR || join(STATE_DIR, 'quotas');
 const CONFIG_PATH = join(QUOTAS_DIR, 'config.json');
 const USAGE_DIR = join(QUOTAS_DIR, 'usage');
 
@@ -116,7 +116,13 @@ function safeReadJson(filePath) {
     return JSON.parse(readFileSync(filePath, 'utf8'));
   } catch (err) {
     if (err.code === 'ENOENT') return null;
-    throw new Error(`Failed to read ${filePath}: ${err.message}`);
+    // Quarantine the corrupt file and surface the error
+    const quarantine = filePath + '.corrupt.' + Date.now();
+    try { renameSync(filePath, quarantine); } catch { /* best effort */ }
+    throw new Error(
+      `Corrupt file at ${filePath} (quarantined to ${quarantine}): ${err.message}. ` +
+      `Refusing to start with empty state.`
+    );
   }
 }
 
@@ -248,6 +254,65 @@ export function setDefaults(defaults) {
   return config.defaults;
 }
 
+// ── File Lock (mkdir-based, matching buddy-registry.mjs pattern) ───
+
+const LOCK_TIMEOUT_MS = 10_000;
+const LOCK_STALE_MS = 60_000;
+
+function getUsageLockPath(agentId) {
+  return getUsagePath(agentId) + '.lock';
+}
+
+function acquireUsageLock(agentId) {
+  const lockPath = getUsageLockPath(agentId);
+  const parentDir = dirname(lockPath);
+  mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+
+  const start = Date.now();
+  while (true) {
+    try {
+      mkdirSync(lockPath);
+      writeFileSync(join(lockPath, 'timestamp'), Date.now().toString());
+      writeFileSync(join(lockPath, 'owner'), randomUUID()); // ownership token
+      return;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      // Check for stale lock
+      try {
+        const tsStr = readFileSync(join(lockPath, 'timestamp'), 'utf8').trim();
+        const lockAge = Date.now() - Number(tsStr);
+        if (!isNaN(lockAge) && lockAge > LOCK_STALE_MS) {
+          releaseUsageLock(agentId);
+          continue;
+        }
+      } catch {
+        /* no timestamp file — check age via directory */
+        try {
+          const lockStat = statSync(lockPath);
+          const lockAge = Date.now() - lockStat.mtimeMs;
+          if (lockAge > LOCK_STALE_MS) {
+            releaseUsageLock(agentId);
+            continue;
+          }
+        } catch { /* ignore */ }
+      }
+      if (Date.now() - start > LOCK_TIMEOUT_MS) {
+        throw new Error(`buddy-quotas: lock timeout after ${LOCK_TIMEOUT_MS}ms for agent ${agentId}. Stale lock at ${lockPath}?`);
+      }
+      // Brief randomized backoff (20-50ms) to reduce contention
+      const deadline = Date.now() + 20 + Math.floor(Math.random() * 30);
+      while (Date.now() < deadline) { /* spin */ }
+    }
+  }
+}
+
+function releaseUsageLock(agentId) {
+  const lockPath = getUsageLockPath(agentId);
+  try { unlinkSync(join(lockPath, 'owner')); } catch { /* ignore */ }
+  try { unlinkSync(join(lockPath, 'timestamp')); } catch { /* ignore */ }
+  try { rmdirSync(lockPath); } catch { /* ignore */ }
+}
+
 // ── Usage Tracking ───────────────────────────────────────────────
 
 function createEmptyUsage(agentId) {
@@ -344,46 +409,51 @@ export function recordUsage(agentId, tokens, model, provider) {
     throw new Error('provider must be a non-empty string');
   }
 
-  const usage = loadUsage(agentId);
+  acquireUsageLock(agentId);
+  try {
+    const usage = loadUsage(agentId);
 
-  // Handle date/month rollovers
-  rolloverDaily(usage);
-  rolloverMonthly(usage);
+    // Handle date/month rollovers
+    rolloverDaily(usage);
+    rolloverMonthly(usage);
 
-  // Increment daily
-  usage.daily.tokens += tokens;
-  usage.daily.requests += 1;
+    // Increment daily
+    usage.daily.tokens += tokens;
+    usage.daily.requests += 1;
 
-  if (!usage.daily.byModel[model]) {
-    usage.daily.byModel[model] = { tokens: 0, requests: 0 };
+    if (!usage.daily.byModel[model]) {
+      usage.daily.byModel[model] = { tokens: 0, requests: 0 };
+    }
+    usage.daily.byModel[model].tokens += tokens;
+    usage.daily.byModel[model].requests += 1;
+
+    if (!usage.daily.byProvider[provider]) {
+      usage.daily.byProvider[provider] = { tokens: 0, requests: 0 };
+    }
+    usage.daily.byProvider[provider].tokens += tokens;
+    usage.daily.byProvider[provider].requests += 1;
+
+    // Increment monthly
+    usage.monthly.tokens += tokens;
+    usage.monthly.requests += 1;
+
+    if (!usage.monthly.byModel[model]) {
+      usage.monthly.byModel[model] = { tokens: 0, requests: 0 };
+    }
+    usage.monthly.byModel[model].tokens += tokens;
+    usage.monthly.byModel[model].requests += 1;
+
+    if (!usage.monthly.byProvider[provider]) {
+      usage.monthly.byProvider[provider] = { tokens: 0, requests: 0 };
+    }
+    usage.monthly.byProvider[provider].tokens += tokens;
+    usage.monthly.byProvider[provider].requests += 1;
+
+    saveUsage(agentId, usage);
+    return usage;
+  } finally {
+    releaseUsageLock(agentId);
   }
-  usage.daily.byModel[model].tokens += tokens;
-  usage.daily.byModel[model].requests += 1;
-
-  if (!usage.daily.byProvider[provider]) {
-    usage.daily.byProvider[provider] = { tokens: 0, requests: 0 };
-  }
-  usage.daily.byProvider[provider].tokens += tokens;
-  usage.daily.byProvider[provider].requests += 1;
-
-  // Increment monthly
-  usage.monthly.tokens += tokens;
-  usage.monthly.requests += 1;
-
-  if (!usage.monthly.byModel[model]) {
-    usage.monthly.byModel[model] = { tokens: 0, requests: 0 };
-  }
-  usage.monthly.byModel[model].tokens += tokens;
-  usage.monthly.byModel[model].requests += 1;
-
-  if (!usage.monthly.byProvider[provider]) {
-    usage.monthly.byProvider[provider] = { tokens: 0, requests: 0 };
-  }
-  usage.monthly.byProvider[provider].tokens += tokens;
-  usage.monthly.byProvider[provider].requests += 1;
-
-  saveUsage(agentId, usage);
-  return usage;
 }
 
 export function getUsage(agentId) {

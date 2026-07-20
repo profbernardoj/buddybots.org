@@ -29,8 +29,7 @@ Friend #1 creates a group chat and adds friends. The moment the group is created
 │  └── Bob's Buddy Bot (workspace-bob, chmod 700)      │
 │                                                      │
 │  ├── XMTP Daemon (per-agent identity, E2E encrypted) │
-│  │   ├── 8-step security pipeline per message         │
-│  │   └── CommsGuard V6 (schema, nonce, peer, PII...)  │
+│  │   └── Envelope schema + payload limits + expiry     │
 │                                                      │
 │  ├── Inference (shared, quota-tracked)                │
 │  │   ├── Ollama + Gemma 4 (local) — PRIMARY           │
@@ -77,7 +76,7 @@ Takes name, phone, and trust profile → generates XMTP identity → creates iso
 Auto-provisions bots on group creation. Detects group membership from channel events, cross-references host's contacts for names/relationships, calls provisioner for each member, sends welcome DMs, announces in group.
 
 ### 4. Bot-to-Bot Coordination (`buddy-coordinate.mjs`)
-10 coordination types over V6 DATA messages:
+10 coordination types over XMTP DATA messages:
 - `schedule-request` / `schedule-response` — find mutual availability
 - `recommendation-request` / `recommendation-response` — preferences
 - `group-plan-propose` / `group-plan-vote` / `group-plan-finalize` — multi-bot planning
@@ -101,9 +100,9 @@ CLI for sending messages between bots. Validates messages, manages conversation 
 
 - **ERC-8004: No PII on-chain.** XMTP address + "Buddy Bot" + protocol version only. No names.
 - **Workspace isolation.** Each buddy bot has `chmod 700` workspace. Host agent cannot access buddy bot memory or conversations.
-- **CommsGuard V6** on every XMTP message: schema validation, nonce replay protection, peer authentication, rate limiting, PII guard, prompt injection detection, trust context check.
+- **CommsGuard security controls** on every XMTP message: envelope schema validation, payload size limits, expiry checks, and trust boundary enforcement (fail-closed). See `docs/ARCHITECTURE.md` for the full control matrix.
 - **Trust profiles:** `public`, `business`, `personal`, `financial`, `full` with topic-scoped sensitivity limits.
-- **HMAC-SHA256 audit chain** — tamper-evident logging.
+- **Not yet implemented:** nonce/replay protection, rate limiting, PII/injection filtering, audit trail. See `docs/ARCHITECTURE.md` for status.
 
 ---
 
@@ -183,7 +182,7 @@ node scripts/buddy-coordinate.mjs send \
 - **Bot-to-bot transport:** XMTP (MLS, E2E encrypted)
 - **Identity:** XMTP wallet addresses + ERC-8004 on Base (no PII)
 - **Inference:** Ollama (Gemma 4) → Morpheus → Venice (fallback chain)
-- **Security:** CommsGuard V6 (8-step pipeline, HMAC audit chain)
+- **Security:** Envelope schema + trust boundaries + payload limits (see `docs/ARCHITECTURE.md`)
 - **Language:** Node.js ES modules, zero npm dependencies
 
 ---
@@ -191,7 +190,7 @@ node scripts/buddy-coordinate.mjs send \
 ## Links
 
 - **GitHub:** [github.com/EverClaw/buddybots.org](https://github.com/EverClaw/buddybots.org)
-- **Architecture doc:** `memory/projects/buddy-bots/architecture-v4.md`
+- **Architecture doc:** `docs/ARCHITECTURE.md` (security control matrix)
 - **Built on:** [EverClaw](https://github.com/EverClaw/EverClaw) + [OpenClaw](https://github.com/openclaw/openclaw) + [XMTP](https://xmtp.org)
 
 ---

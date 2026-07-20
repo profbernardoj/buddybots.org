@@ -26,6 +26,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID, randomBytes } from 'node:crypto';
 import { homedir, platform } from 'node:os';
+import { STATE_DIR, EVERCLAW_DIR } from './paths.mjs';
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -34,7 +35,8 @@ const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, '..');
 
 const HOME = homedir();
-const EVERCLAW_DIR = process.env.EVERCLAW_DIR || join(HOME, '.everclaw');
+
+// EVERCLAW_DIR and STATE_DIR are now imported from paths.mjs
 
 const IDENTITY_FILENAME = 'identity.json';
 const SECRETS_FILENAME = '.secrets.json';
@@ -139,8 +141,15 @@ export function atomicWrite(filePath, content, mode = 0o600) {
 export function readJsonSafe(filePath) {
   try {
     return JSON.parse(readFileSync(filePath, 'utf8'));
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null; // genuinely absent is fine
+    // Quarantine the corrupt file and surface the error
+    const quarantine = filePath + '.corrupt.' + Date.now();
+    try { renameSync(filePath, quarantine); } catch { /* best effort */ }
+    throw new Error(
+      `Corrupt file at ${filePath} (quarantined to ${quarantine}): ${err.message}. ` +
+      `Refusing to start with empty state.`
+    );
   }
 }
 

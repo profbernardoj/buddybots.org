@@ -35,6 +35,7 @@ import { platform } from 'node:os';
 
 import { provision, deprovision, deriveAgentId } from './buddy-provision.mjs';
 import { lookupByPhone, listBuddies as registryListBuddies } from './buddy-registry.mjs';
+import { STATE_DIR } from './paths.mjs';
 
 // ── Paths ────────────────────────────────────────────────────────
 
@@ -42,8 +43,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, '..');
 const HOME = process.env.HOME || '';
-const EVERCLAW_DIR = join(HOME, '.everclaw');
-const GROUPS_FILE = process.env.BUDDY_GROUPS_PATH || join(EVERCLAW_DIR, 'buddy-groups.json');
+const GROUPS_FILE = process.env.BUDDY_GROUPS_PATH || join(STATE_DIR, 'buddy-groups.json');
 
 const CURRENT_VERSION = 1;
 const LOCK_TIMEOUT_MS = 10_000;
@@ -146,8 +146,13 @@ export function loadGroups(groupsPath = GROUPS_FILE) {
       groups: data.groups || {}
     };
   } catch (err) {
-    console.error('[buddy-host] Failed to load groups:', err.message);
-    return { version: CURRENT_VERSION, groups: {} };
+    // Quarantine the corrupt file and surface the error
+    const quarantine = groupsPath + '.corrupt.' + Date.now();
+    try { renameSync(groupsPath, quarantine); } catch { /* best effort */ }
+    throw new Error(
+      `Corrupt groups file at ${groupsPath} (quarantined to ${quarantine}): ${err.message}. ` +
+      `Refusing to start with empty state.`
+    );
   }
 }
 
@@ -229,15 +234,30 @@ export function resolveContact(phone) {
 }
 
 /**
- * Infer trust profile from contact data.
- * Checks both relationship field (when available from enriched contacts)
- * and contact name as fallback (works with current resolveContact output).
- * Conservative default: 'public'.
+ * Suggest a trust profile based on contact metadata.
+ *
+ * SECURITY: This is a SUGGESTION ONLY — never used as an enforced trust level.
+ * Display names and relationship labels are attacker-controllable. The return
+ * value should be shown to the human user for confirmation, never auto-applied.
  *
  * @param {{ name: string|null, relationship: string|null, source: string }} contact
- * @returns {string} Trust profile: public | business | personal
+ * @returns {string} Suggested trust profile: public | business | personal
  */
 export function inferTrustProfile(contact) {
+  // SECURITY: Never derive authorization from attacker-controllable display names.
+  // Always default to least privilege. Require explicit human confirmation to raise trust.
+  return 'public';
+}
+
+/**
+ * Suggest a trust profile based on contact name/relationship keywords.
+ * The result is advisory only — display it in the UI/CLI for the human to confirm.
+ * Never use the return value as the enforced trust level.
+ *
+ * @param {{ name: string|null, relationship: string|null, source: string }} contact
+ * @returns {string} Suggested profile label for UI display only
+ */
+export function suggestTrustProfile(contact) {
   if (!contact) return 'public';
 
   // Use relationship if available (future enrichment), fall back to name
