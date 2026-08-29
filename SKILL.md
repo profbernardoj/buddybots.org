@@ -1,6 +1,6 @@
 ---
 name: everclaw
-version: 2026.6.18.1803
+version: 2026.8.28.2116
 # NOTE: Description must stay identical to root SKILL.md. Update both files together.
 description: Open-source first AI inference — GLM-5 as default, Claude as fallback only. Own your inference forever via the [REDACTED] decentralized network. Stake MOR tokens, access GLM-5, GLM-4.7 Flash, Kimi K2.5, and 30+ models with persistent inference by recycling staked MOR. Open-source first model router routes all tiers to [REDACTED] by default — Claude only kicks in as an escape hatch when needed. Includes [REDACTED] API Gateway bootstrap for zero-config startup, OpenAI-compatible proxy with auto-session management, automatic retry with fresh sessions, OpenAI-compatible error classification to prevent cooldown cascades, multi-key auth rotation v2 with proactive DIEM balance monitoring and reactive 402 watchdog, Gateway Guardian v5 with direct curl inference probes (eliminates Signal spam), proactive Venice DIEM credit monitoring, circuit breaker for stuck sub-agents, nuclear self-healing restart, always-on proxy-router with launchd auto-restart, smart session archiver, three-shift cyclic execution engine (v2 with 15-minute execution loops), 24/7 always-on power configuration for macOS, bundled security skills, zero-dependency wallet management via macOS Keychain, x402 payment client for agent-to-agent USDC payments, ERC-8004 agent registry reader for discovering trustless agents on Base, and hardware-aware local Ollama fallback with auto model selection (Gemma 4 family: E2B/E4B/26B/31B with vision + audio, based on available RAM/GPU).
 homepage: https://everclaw.com
@@ -2450,6 +2450,59 @@ node scripts/everclaw-migrate.mjs status
 | `import` | Generate import commands for target |
 | `status` | Check current migration status |
 
+### Full-Host Migration (migrate-export / migrate-import)
+
+Whole-host migration between OpenClaw instances (Gap 8). Exports config,
+dependencies, cron jobs, keychain secrets, workspaces and skills state into a
+single passphrase-encrypted bundle; imports it on the target host.
+
+```bash
+# On the SOURCE host — creates <bundle>.tar.gz.enc and prints the
+# out-of-band SHA-256 of the encrypted file
+node scripts/migrate-export.mjs --passphrase <pass> [--role primary|worker] [--output <path>]
+
+# On the TARGET host — verify + import
+node scripts/migrate-import.mjs --import <bundle>.tar.gz.enc --passphrase <pass> \
+  [--expected-checksum <sha256 printed by export>] [--dry-run] [--force]
+```
+
+**Bundle format v2 (manifest schema 2.0):**
+
+```
+bundle.tar.gz.enc (AES-256-GCM + scrypt)
+└── manifest.json               # metadata + per-file SHA-256 table + self-checksum
+    ├── dependency-manifest.json # runtime deps with install commands
+    ├── config.json.tmpl         # openclaw config, {{HOME}}-templated
+    ├── keychain.json.enc        # keychain secrets (encrypted, never cleartext)
+    ├── cron-jobs.json           # JSON API import (never SQL)
+    ├── skills-state.json        # skills + .wanted map (doctor-disabled re-enabled)
+    ├── workspaces.tar.gz        # main workspace + workspace-* sub-agents
+    └── RUNBOOK.md               # generated import instructions
+```
+
+**Tamper protection (two layers):**
+
+1. **In-bundle** — per-file SHA-256 checksums including a normalized
+   manifest self-checksum; validated by `unpackBundle` on every import.
+   Guards against accidental corruption.
+2. **Out-of-band** — export prints the SHA-256 of the ENCRYPTED bundle file.
+   Pass it as `--expected-checksum` on import to guard against deliberate
+   tampering (even by a passphrase holder). The value is deliberately NOT
+   stored inside the bundle (a file cannot hash its own final bytes).
+
+**Role policy:** `--role worker` imports all cron jobs with `enabled:false`
+(no double execution); `primary` imports them enabled. Pending cron jobs are
+staged to `~/.openclaw/pending-cron-import.json` for the agent to create via
+the gateway API — never written via SQL.
+
+**Keychain:** macOS keychain items are matched by their stored account name
+(`-a` value) and restored with the same account, so lookups succeed on a
+differently-named target user. Missing services are reported in the manifest
+(`keychainMissing`), never silently skipped.
+
+**Deliberately NOT portable:** Signal account link (one number per instance),
+session history (non-portable across versions).
+
 ### Backup File Format
 
 EverClaw backups are AGE-encrypted tar.zst archives containing:
@@ -2848,6 +2901,21 @@ node scripts/buddy-export.mjs --import ~/alice-backup.tar.gz --force
 ---
 
 ## Changelog
+
+### Unreleased — Full-Host Migration (Gap 8)
+- **`scripts/migrate-export.mjs`** (614 lines) + **`scripts/migrate-import.mjs`** (506 lines)
+  - Single passphrase-encrypted bundle (AES-256-GCM + scrypt, schema 2.0)
+  - Collects: config ({{HOME}}-templated), deps, crons (JSON API, never SQL),
+    keychain secrets, workspaces (main + sub-agents), skills state with `.wanted` map
+  - Out-of-band SHA-256 of encrypted file = tamper gate (hashes the artifact the operator holds)
+  - Manifest self-checksum (normalized fixed-point) + mandatory in-bundle per-file checksums
+  - Outer + inner tar member whitelist + type whitelist (regular files + dirs only)
+  - Role policy: `worker` imports crons disabled
+  - Preflight: platform and openclaw checks are warnings (not blocks); config conflict is a block
+  - `MIGRATE_PASSPHRASE` env recommended over `--passphrase` argv (security)
+- **`scripts/migrate.test.mjs`** (473 lines) — 37 tests
+- **`docs/migration-runbook-template.md`** — pre-planning template
+- Audited: Grok R11 = EXCELLENT, Claude Opus 4.8 R5 = EXCELLENT. PII clean.
 
 ### 2026.5.15.1418
 - **OpenClaw pin** v2026.5.7 → v2026.5.12
