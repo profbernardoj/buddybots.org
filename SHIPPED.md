@@ -2,7 +2,8 @@
 
 ## 2026.8.28.2116 — Full-Host Migration Export/Import (Gap 8)
 
-**SOP-001 Pipeline:** Stages 0-7 COMPLETE, Stage 8 DEPLOYED.
+**SOP-001 Pipeline:** ALL STAGES COMPLETE (0-9). Stage 10 (real round-trip validation) pending — non-blocking.
+**User guide:** `~/Documents/InstallOpenClaw/migrate-agent-guide.md`
 
 ### What Shipped
 
