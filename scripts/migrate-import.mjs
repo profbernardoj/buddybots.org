@@ -19,12 +19,14 @@
  *                           [--force] [--dry-run] [--expected-checksum <sha256>] [--help]
  */
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, mkdtempSync,
+         createReadStream, createWriteStream, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, resolve } from 'node:path';
 import { homedir, tmpdir, platform } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { decryptBuffer } from './migrate-export.mjs';
+import { pipeline } from 'node:stream/promises';
+import { decryptBuffer, decryptFileStreaming } from './migrate-export.mjs';
 import { OPENCLAW_DIR } from './paths.mjs';
 
 const SUPPORTED_SCHEMA = '2.0';
@@ -61,7 +63,7 @@ export function gatewayCommand(version) {
  * platforms where the tar carries ownership (e.g. root-created bundles).
  */
 export function extractSafeWorkspaces(wsTar, openclawDir) {
-  const members = sh('tar', ['-tzf', wsTar], { timeout: 60000 })
+  const members = sh('tar', ['-tf', wsTar], { timeout: 60000 })
     .split('\n').filter(Boolean);
   const bad = [];
   for (const m of members) {
@@ -79,12 +81,12 @@ export function extractSafeWorkspaces(wsTar, openclawDir) {
   // Symlink members are ambiguous to vet reliably; require none.
   // Claude R3: whitelist types — reject hardlinks (h), device nodes (b/c),
   // FIFOs (p) too. Only regular files (-) and directories (d) allowed.
-  if (sh('tar', ['-tvzf', wsTar], { timeout: 60000 }).split('\n').filter(Boolean).some(l => !/^[\-d]/.test(l))) {
+  if (sh('tar', ['-tvf', wsTar], { timeout: 60000 }).split('\n').filter(Boolean).some(l => !/^[\-d]/.test(l))) {
     throw new Error('unsafe workspace tar: only regular files and directories are allowed');
   }
   const extractDirHint = mkdtempSync(join(tmpdir(), 'mig-ws-'));
   try {
-    sh('tar', ['-xzf', wsTar, '-C', extractDirHint, '--no-same-owner'], { timeout: 300000 });
+    sh('tar', ['-xf', wsTar, '-C', extractDirHint, '--no-same-owner'], { timeout: 600000 });
     for (const top of ['workspace', ...Array.from(new Set(members.map(m => m.split('/')[0]).filter(t => t.startsWith('workspace-'))))]) {
       const src = join(extractDirHint, top);
       const dst = join(openclawDir, top);
@@ -101,31 +103,30 @@ export function extractSafeWorkspaces(wsTar, openclawDir) {
 }
 
 
-export function unpackBundle(bundlePath, passphrase, stagingDir, expectedChecksum = null) {
+export async function unpackBundle(bundlePath, passphrase, stagingDir, expectedChecksum = null) {
   if (!existsSync(bundlePath)) throw new Error(`bundle not found: ${bundlePath}`);
   mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
-  const raw = readFileSync(bundlePath);
 
   // Out-of-band integrity gate (R3, Claude B1 fix): the ENCRYPTED FILE is
   // verified against the SHA-256 printed by export BEFORE decryption. The
   // exporter hashes the exact artifact the operator holds, so any tampering
   // (including a passphrase holder re-tarring the contents) breaks the match.
   if (expectedChecksum) {
-    const actual = createHash('sha256').update(raw).digest('hex');
+    const h = createHash('sha256');
+    await pipeline(createReadStream(bundlePath, { highWaterMark: 1024 * 1024 * 8 }), h);
+    const actual = h.digest('hex');
     if (actual !== expectedChecksum) {
       throw new Error(`bundle checksum MISMATCH — expected ${expectedChecksum}, got ${actual}; do not import (possible tampering)`);
     }
   }
 
-  let tarData;
+  // Streaming decryption (handles >2 GiB bundles).
+  const tmpTar = join(stagingDir, 'bundle.tar');
   try {
-    tarData = decryptBuffer(raw, passphrase);
+    await decryptFileStreaming(bundlePath, tmpTar, passphrase);
   } catch {
     throw new Error('decryption failed — wrong passphrase or corrupt bundle');
   }
-
-  const tmpTar = join(stagingDir, 'bundle.tar.gz');
-  writeFileSync(tmpTar, tarData, { mode: 0o600 });
   const extractDir = join(stagingDir, 'extracted');
   mkdirSync(extractDir, { recursive: true, mode: 0o700 });
   // Claude R2 Security fix: validate outer tar members BEFORE extraction.
@@ -134,8 +135,8 @@ export function unpackBundle(bundlePath, passphrase, stagingDir, expectedChecksu
   // out-of-band checksum, so --expected-checksum does not help here).
   const EXPECTED_MEMBERS = new Set(['manifest.json', 'dependency-manifest.json',
     'config.json.tmpl', 'skills-state.json', 'cron-jobs.json',
-    'workspaces.tar.gz', 'keychain.json.enc', 'RUNBOOK.md', '.']);
-  const members = sh('tar', ['-tzf', tmpTar], { timeout: 60000 })
+    'workspaces.tar', 'workspaces.tar.gz', 'keychain.json.enc', 'RUNBOOK.md', '.']);
+  const members = sh('tar', ['-tf', tmpTar], { timeout: 60000 })
     .split('\n').filter(Boolean);
   for (const m of members) {
     const rel = m.replace(/\/+$/, '').replace(/^\.\//, '');
@@ -146,10 +147,10 @@ export function unpackBundle(bundlePath, passphrase, stagingDir, expectedChecksu
   }
   // Claude R3 Security fix: whitelist member types (regular files + dirs only).
   // Reject symlinks (l), hardlinks (h), device nodes (b/c), FIFOs (p).
-  if (sh('tar', ['-tvzf', tmpTar], { timeout: 60000 }).split('\n').filter(Boolean).some(l => !/^[\-d]/.test(l))) {
+  if (sh('tar', ['-tvf', tmpTar], { timeout: 60000 }).split('\n').filter(Boolean).some(l => !/^[\-d]/.test(l))) {
     throw new Error('unsafe bundle: only regular files and directories are allowed');
   }
-  sh('tar', ['-xzf', tmpTar, '-C', extractDir, '--no-same-owner'], { timeout: 300000 });
+  sh('tar', ['-xf', tmpTar, '-C', extractDir, '--no-same-owner'], { timeout: 600000 });
   rmSync(tmpTar, { force: true });
 
   const manifestPath = join(extractDir, 'manifest.json');
@@ -324,7 +325,7 @@ export function burnCommand(bundlePath) {
 
 // ── Orchestrator ─────────────────────────────────────────────────
 
-export function importMigrateBundle(options = {}) {
+export async function importMigrateBundle(options = {}) {
   const {
     importPath,
     expectedChecksum = null,
@@ -342,7 +343,7 @@ export function importMigrateBundle(options = {}) {
   const report = { steps: [], warnings: [], ok: true };
 
   try {
-    const { manifest, extractDir } = unpackBundle(importPath, passphrase, staging, expectedChecksum);
+    const { manifest, extractDir } = await unpackBundle(importPath, passphrase, staging, expectedChecksum);
     report.manifest = { created: manifest.created, role: manifest.role, source: manifest.source };
 
     // Preflight
@@ -493,12 +494,16 @@ AFTER IMPORT: run the verification checklist, then DELETE the bundle.`);
     process.exit(args.help ? 0 : 1);
   }
   try {
-    const res = importMigrateBundle(args);
-    console.log(JSON.stringify(res, null, 2));
-    if (!res.dryRun && res.burn) {
-      console.error('\n⚠️  DELETE the bundle after verification:');
-      console.error(`   ${res.burn}`);
-    }
+    importMigrateBundle(args).then(res => {
+      console.log(JSON.stringify(res, null, 2));
+      if (!res.dryRun && res.burn) {
+        console.error('\n⚠️  DELETE the bundle after verification:');
+        console.error(`   ${res.burn}`);
+      }
+    }).catch(err => {
+      console.error(`❌ ${err.message}`);
+      process.exit(1);
+    });
   } catch (err) {
     console.error(`❌ ${err.message}`);
     process.exit(1);

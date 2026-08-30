@@ -26,12 +26,13 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, chmodSync,
-         createReadStream, rmSync, mkdtempSync } from 'node:fs';
+         createReadStream, createWriteStream, rmSync, mkdtempSync } from 'node:fs';
 import { join, dirname, resolve, basename } from 'node:path';
 import { homedir, tmpdir, arch, platform, EOL } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto';
 import { STATE_DIR, OPENCLAW_DIR } from './paths.mjs';
+import { pipeline } from 'node:stream/promises';
 
 const MANIFEST_VERSION = '2.0';
 const MIN_PASSPHRASE_LEN = 16;
@@ -278,6 +279,89 @@ export function decryptBuffer(blob, passphrase) {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
+/**
+ * Streaming encryption for large files (>2 GiB).
+ * Format: salt(16) + iv(12) + ciphertext + tag(16)
+ * Uses a header file + streaming pipeline, then concatenates.
+ */
+export async function encryptFileStreaming(inputPath, outputPath, passphrase) {
+  const salt = randomBytes(16);
+  const key = scryptSync(passphrase, salt, 32, KDF_OPTS);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+
+  // Write header (salt+iv) to temp file
+  const tmpCipher = outputPath + '.cipher';
+  const fs = await import('node:fs/promises');
+  await fs.writeFile(outputPath + '.hdr', Buffer.concat([salt, iv]));
+
+  // Stream: input plaintext → cipher → cipher-file
+  await pipeline(
+    createReadStream(inputPath, { highWaterMark: 1024 * 1024 * 8 }),
+    cipher,
+    createWriteStream(tmpCipher)
+  );
+
+  // Append GCM auth tag to cipher file
+  const tag = cipher.getAuthTag();
+  await fs.appendFile(tmpCipher, tag);
+
+  // Concatenate: header + cipher+tag → output
+  await pipeline(
+    createReadStream(outputPath + '.hdr'),
+    createWriteStream(outputPath)
+  );
+  await pipeline(
+    createReadStream(tmpCipher),
+    createWriteStream(outputPath, { flags: 'a' })
+  );
+
+  // Cleanup temps
+  await fs.unlink(outputPath + '.hdr').catch(() => {});
+  await fs.unlink(tmpCipher).catch(() => {});
+}
+
+/**
+ * Streaming decryption for large files (>2 GiB).
+ * Reads header (salt+iv) from input, decrypts in chunks.
+ * Verifies GCM tag at the end.
+ */
+export async function decryptFileStreaming(inputPath, outputPath, passphrase) {
+  const fs = await import('node:fs/promises');
+  const stat = await fs.stat(inputPath);
+  if (stat.size < 44) throw new Error('Encrypted file too short');
+
+  // Read header (salt + iv = 28 bytes) and tag (last 16 bytes)
+  const fd = await fs.open(inputPath, 'r');
+  const header = Buffer.alloc(28);
+  await fd.read(header, 0, 28, 0);
+  const tag = Buffer.alloc(16);
+  await fd.read(tag, 0, 16, stat.size - 16);
+  await fd.close();
+
+  const salt = header.subarray(0, 16);
+  const iv = header.subarray(16, 28);
+  const key = scryptSync(passphrase, salt, 32, KDF_OPTS);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+
+  // Stream: input[28:size-16] → decipher → output
+  // Create a read stream that skips the first 28 bytes and stops 16 before end
+  const { createReadStream: crs } = await import('node:fs');
+  const totalCipherLen = stat.size - 28 - 16;
+  const input = crs(inputPath, {
+    start: 28,
+    end: 28 + totalCipherLen - 1,
+    highWaterMark: 1024 * 1024 * 8
+  });
+
+  try {
+    await pipeline(input, decipher, createWriteStream(outputPath));
+  } catch (err) {
+    throw new Error(`decryption stream failed: ${err.message}`);
+  }
+}
+
 // ── Workspace packing (L12) ──────────────────────────────────────
 
 /**
@@ -351,7 +435,7 @@ export function generateRunbook(manifest, deps) {
  * @param {string} [options.stagingDir] — override for testing
  * @param {boolean} [options.dryRun=false]
  */
-export function exportMigrateBundle(options = {}) {
+export async function exportMigrateBundle(options = {}) {
   const {
     output = null,
     role = 'primary',
@@ -435,11 +519,18 @@ export function exportMigrateBundle(options = {}) {
     writeFileSync(join(stage, 'cron-jobs.json'), JSON.stringify(crons, null, 2), { mode: 0o600 });
   }
 
-  // Workspaces tar.gz (L12: includes sub-agent workspaces automatically)
+  // Workspaces tar (L12: includes sub-agent workspaces automatically)
+  // NO -z flag: macOS bsdtar gzip has a 2 GiB internal limit.
+  // The outer bundle tar uses -z for compression.
   const workspaces = findWorkspaces(openclawDir);
   if (workspaces.length > 0) {
-    execFileSync('tar', ['-czf', join(stage, 'workspaces.tar.gz'),
-      '-C', openclawDir, ...workspaces.map(w => w.name)], { timeout: 300000 });
+    const tarArgs = ['-cf', join(stage, 'workspaces.tar'),
+      '-C', openclawDir, ...workspaces.map(w => w.name)];
+    const wsResult = spawnSync('tar', tarArgs,
+      { timeout: 600000 });
+    if (wsResult.status !== 0) {
+      throw new Error(`workspace tar failed (exit ${wsResult.status}): ${wsResult.stderr?.toString()?.slice(0, 500)}`);
+    }
   }
 
   // Encrypted keychain map (inner layer; the outer bundle tar is encrypted too —
@@ -458,7 +549,7 @@ export function exportMigrateBundle(options = {}) {
   // Payload list for checksumming (finalized after the runbook write below).
   const payloadFiles = ['dependency-manifest.json', 'config.json.tmpl', 'skills-state.json', 'RUNBOOK.md'];
   if (crons) payloadFiles.push('cron-jobs.json');
-  if (workspaces.length > 0) payloadFiles.push('workspaces.tar.gz');
+  if (workspaces.length > 0) payloadFiles.push('workspaces.tar');
   payloadFiles.push('keychain.json.enc');
 
   // Single definitive tar pass (no two-pass: nothing inside the bundle needs
@@ -475,7 +566,10 @@ export function exportMigrateBundle(options = {}) {
     // exactly as they will ship.
     const finalChecksums = {};
     for (const f of payloadFiles) {
-      finalChecksums[f] = createHash('sha256').update(readFileSync(join(stage, f))).digest('hex');
+      // Streaming hash for large files (>2 GiB workspaces.tar)
+      const h = createHash('sha256');
+      await pipeline(createReadStream(join(stage, f), { highWaterMark: 1024 * 1024 * 8 }), h);
+      finalChecksums[f] = h.digest('hex');
     }
     manifest.checksums = finalChecksums;
 
@@ -491,12 +585,22 @@ export function exportMigrateBundle(options = {}) {
     writeFileSync(join(stage, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
 
     // Definitive tar + encrypt to the output path.
-    execFileSync('tar', ['-czf', tarPath, '-C', stage, '.'], { timeout: 300000 });
-    const finalTar = readFileSync(tarPath);
-    writeFileSync(outPath, encryptBuffer(finalTar, passphrase), { mode: 0o600 });
+    // Use spawnSync for tar (no buffer issue — writes to file).
+    const tarResult = spawnSync('tar', ['-cf', tarPath, '-C', stage, '.'],
+      { timeout: 600000, maxBuffer: 1024 * 1024 * 1024 * 4 });
+    if (tarResult.status !== 0) {
+      throw new Error(`bundle tar failed (exit ${tarResult.status}): ${tarResult.stderr?.toString()?.slice(0, 500)}`);
+    }
+    // Stream-encrypt the tar (handles >2 GiB files).
+    await encryptFileStreaming(tarPath, outPath, passphrase);
     // B1 fix (Claude audit): the out-of-band checksum is the SHA-256 of the
     // ENCRYPTED FILE — the exact artifact the operator holds and imports.
-    bundleChecksum = checksumOf(readFileSync(outPath));
+    const ckHash = createHash('sha256');
+    await pipeline(
+      createReadStream(outPath, { highWaterMark: 1024 * 1024 * 8 }),
+      ckHash
+    );
+    bundleChecksum = ckHash.digest('hex');
   } finally {
     rmSync(tmpTarDir, { recursive: true, force: true });
     rmSync(stage, { recursive: true, force: true });
@@ -594,21 +698,23 @@ SECURITY: the bundle is encrypted (AES-256-GCM, scrypt). Delete it after import.
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('migrate-export.mjs')) {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) { printHelp(); process.exit(0); }
-  try {
-    const res = exportMigrateBundle(args);
-    if (res.dryRun) {
-      console.log('DRY RUN — no files written.');
-      console.log(JSON.stringify({ manifest: res.manifest, cronCount: res.cronCount, deps: res.deps.commands }, null, 2));
-    } else {
-      console.log(`✅ Bundle: ${res.outputPath}`);
-      console.log(`   workspaces: ${res.workspaceCount} · crons: ${res.cronCount} · keychain: ${res.keychainCount} (missing: ${res.keychainMissing.join(', ') || 'none'})`);
-      console.log(`   config paths literalized: ${res.manifest.configPathHitsLiteralized}`);
-      console.log(`   SHA-256 (encrypted bundle file): ${res.bundleChecksum}`);
-      console.log(`   Short match: ${res.bundleChecksum ? res.bundleChecksum.slice(0, 12) : 'n/a'} — compare this value with the bundle BEFORE importing (out-of-band)`);
-      console.log('⚠️  DELETE this bundle after successful import — it contains live secrets.');
+  (async () => {
+    try {
+      const res = await exportMigrateBundle(args);
+      if (res.dryRun) {
+        console.log('DRY RUN — no files written.');
+        console.log(JSON.stringify({ manifest: res.manifest, cronCount: res.cronCount, deps: res.deps.commands }, null, 2));
+      } else {
+        console.log(`✅ Bundle: ${res.outputPath}`);
+        console.log(`   workspaces: ${res.workspaceCount} · crons: ${res.cronCount} · keychain: ${res.keychainCount} (missing: ${res.keychainMissing.join(', ') || 'none'})`);
+        console.log(`   config paths literalized: ${res.manifest.configPathHitsLiteralized}`);
+        console.log(`   SHA-256 (encrypted bundle file): ${res.bundleChecksum}`);
+        console.log(`   Short match: ${res.bundleChecksum ? res.bundleChecksum.slice(0, 12) : 'n/a'} — compare this value with the bundle BEFORE importing (out-of-band)`);
+        console.log('⚠️  DELETE this bundle after successful import — it contains live secrets.');
+      }
+    } catch (err) {
+      console.error(`❌ ${err.message}`);
+      process.exit(1);
     }
-  } catch (err) {
-    console.error(`❌ ${err.message}`);
-    process.exit(1);
-  }
+  })();
 }
