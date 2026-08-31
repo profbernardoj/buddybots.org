@@ -37,6 +37,9 @@ const { values: args } = parseArgs({
   options: {
     token:            { type: "string" },
     file:             { type: "string" },
+    "install-script":  { type: "string" },
+    "scripts-dir":      { type: "string" },
+    "keep-archive":     { type: "boolean", default: false },
     "public-base-url": { type: "string", default: "" },
     help:             { type: "boolean", short: "h", default: false },
   },
@@ -61,6 +64,9 @@ if (!args.token || !args.file) {
 
 const TOKEN = args.token;
 const FILE_PATH = resolve(args.file);
+const INSTALL_SCRIPT_PATH = args["install-script"] ? resolve(args["install-script"]) : null;
+const SCRIPTS_DIR = args["scripts-dir"] ? resolve(args["scripts-dir"]) : null;
+const KEEP_ARCHIVE = args["keep-archive"] === true;
 
 if (!existsSync(FILE_PATH)) {
   console.error(`ERROR: File not found: ${FILE_PATH}`);
@@ -173,22 +179,23 @@ function setCorsHeaders(res, req) {
 
 // ── Cleanup & Shutdown ─────────────────────────────────────────────
 
-function cleanup(deleteArchive = true) {
+function cleanup(deleteArchive = !KEEP_ARCHIVE) {
   if (shutdownTimer) clearTimeout(shutdownTimer);
   removePid();
-  if (deleteArchive) {
+  if (!KEEP_ARCHIVE) {
     try {
       shredFile(FILE_PATH);
       console.error(`Securely deleted archive: ${FILE_PATH}`);
     } catch {
-      // Fallback: plain unlink if shred fails
       try { unlinkSync(FILE_PATH); } catch { /* already gone */ }
       console.error(`Deleted archive (plain unlink): ${FILE_PATH}`);
     }
+  } else {
+    console.error(`Bundle kept on source (--keep-archive): ${FILE_PATH}`);
   }
 }
 
-function shutdown(reason, deleteArchive = true) {
+function shutdown(reason, deleteArchive = !KEEP_ARCHIVE) {
   console.error(`Shutting down: ${reason}`);
   cleanup(deleteArchive);
   process.exit(0);
@@ -220,8 +227,52 @@ const server = createServer((req, res) => {
     return;
   }
 
-  // Extract token from URL path: /<token>
-  const requestToken = (req.url || "").replace(/^\//, "").split("?")[0];
+  // ── Migration endpoints (Gap 8 simplification: Option D) ──────────
+  // GET /install → serve the generated per-session install script
+  if (req.url === "/install") {
+    if (!INSTALL_SCRIPT_PATH || !existsSync(INSTALL_SCRIPT_PATH)) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "install script not available" }));
+      return;
+    }
+    const script = readFileSync(INSTALL_SCRIPT_PATH, "utf8");
+    res.writeHead(200, {
+      "Content-Type": "text/x-shellscript; charset=utf-8",
+      "Content-Disposition": 'inline; filename="install.sh"',
+      "Content-Length": Buffer.byteLength(script),
+    });
+    res.end(script);
+    return;
+  }
+
+  // GET /scripts/<name> → serve migrate-import.mjs, migrate-export.mjs, paths.mjs
+  if (req.url?.startsWith("/scripts/")) {
+    const name = basename(req.url.replace("/scripts/", "").split("?")[0]);
+    // Whitelist: only allow serving known migration scripts (no path traversal)
+    const ALLOWED = new Set(["migrate-import.mjs", "migrate-export.mjs", "paths.mjs"]);
+    if (!ALLOWED.has(name) || !SCRIPTS_DIR) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "script not available" }));
+      return;
+    }
+    const scriptPath = join(SCRIPTS_DIR, name);
+    if (!existsSync(scriptPath)) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `${name} not found` }));
+      return;
+    }
+    const content = readFileSync(scriptPath);
+    res.writeHead(200, {
+      "Content-Type": "text/javascript; charset=utf-8",
+      "Content-Length": content.length,
+    });
+    res.end(content);
+    return;
+  }
+
+  // Extract token from URL path: /<token> or /<token>/<bundle-name>
+  const pathParts = (req.url || "").replace(/^\//, "").split("?")[0].split("/");
+  const requestToken = pathParts[0];
 
   // Validate token
   if (requestToken !== TOKEN) {

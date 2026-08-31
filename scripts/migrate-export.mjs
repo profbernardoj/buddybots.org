@@ -38,6 +38,11 @@ const MANIFEST_VERSION = '2.0';
 const MIN_PASSPHRASE_LEN = 16;
 const BUNDLE_NAME_STEM = 'migrate-bundle';
 
+// OpenClaw version pin (David, 2026-08-31): NEVER use @latest —
+// 8.1.2024 is a major unstable change. Probe the source version at export;
+// fall back to the current proven version if the binary is absent.
+const PINNED_OPENCLAW_VERSION = '2026.7.1-2';
+
 // Known plugin-id → npm package map (proven 2026-08-27 on bernardo3).
 const PLUGIN_NPM_MAP = {
   signal: '@openclaw/signal',
@@ -55,13 +60,29 @@ function probeVersion(cmd, args) {
 }
 
 function probeHost() {
+  const ocVersion = probeVersion('openclaw', ['--version']);
   return {
     platform: platform(),
     arch: arch(),
     node: process.version,
-    openclaw: probeVersion('openclaw', ['--version']),
+    openclaw: ocVersion || `OpenClaw ${PINNED_OPENCLAW_VERSION}`,
+    openclawPinned: PINNED_OPENCLAW_VERSION,
     ollamaModels: probeOllamaModels(),
   };
+}
+
+/**
+ * Extract a clean version string for npm install.
+ * `openclaw --version` returns "OpenClaw 2026.7.1-2 (0790d9f)" → "2026.7.1-2".
+ * Falls back to PINNED_OPENCLAW_VERSION.
+ */
+export function probeOpenclawVersion() {
+  const raw = probeVersion('openclaw', ['--version']);
+  if (raw) {
+    const m = raw.match(/(\d{4}\.\d+\.\d+[-.]\d+)/);
+    if (m) return m[1];
+  }
+  return PINNED_OPENCLAW_VERSION;
 }
 
 function probeOllamaModels() {
@@ -79,6 +100,8 @@ function probeOllamaModels() {
  */
 export function buildDependencyManifest(cfg, targetPlatform = process.platform) {
   const deps = { brew: [], casks: [], npmGlobal: [], plugins: [], ollamaModels: [], commands: [], unknownPlugins: [] };
+  const ocVer = probeOpenclawVersion();
+  const ocInstall = `npm install -g openclaw@${ocVer}`;
 
   const pluginEntries = cfg?.plugins?.entries || {};
   for (const [id, entry] of Object.entries(pluginEntries)) {
@@ -105,11 +128,16 @@ export function buildDependencyManifest(cfg, targetPlatform = process.platform) 
   // Linux-hosted bundle can still tell a macOS ClawBox user to `brew install`.
   // Explicitly: brew is macOS-only; Linux targets use apt/npm.
   if (targetPlatform === 'darwin') {
-    deps.commands.unshift('# Core runtime:', 'brew install node', 'npm install -g openclaw@latest');
+    deps.commands.unshift('# Core runtime:', 'brew install node', ocInstall);
   } else if (targetPlatform === 'linux') {
-    deps.commands.unshift('# Core runtime:', 'apt-get update && apt-get install -y nodejs npm', 'npm install -g openclaw@latest');
+    // NodeSource for Debian/Ubuntu (David approved 2026-08-31).
+    // Falls through to apt nodejs/npm if NodeSource fails.
+    deps.commands.unshift('# Core runtime:',
+      "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
+      'apt-get install -y nodejs',
+      ocInstall);
   } else {
-    deps.commands.unshift('# Core runtime:', 'npm install -g openclaw@latest');
+    deps.commands.unshift('# Core runtime:', ocInstall);
   }
 
   return deps;
@@ -390,6 +418,7 @@ export function generateRunbook(manifest, deps) {
     '# Migration Runbook (generated)', '',
     `Source host: ${manifest.source.host} (${manifest.source.platform}/${manifest.source.arch})`,
     `OpenClaw: ${manifest.source.openclaw || 'unknown'} · Node: ${manifest.source.node}`,
+    `OpenClaw PIN: openclaw@${manifest.source.openclawPinned || 'unversioned'} — do NOT install @latest (8.1.x is unstable for this setup)`,
     `Role: ${manifest.role} — ${roleNote}`, '',
     '## 1. Core runtime + dependencies',
     '```', ...deps.commands, '```', '',
@@ -493,7 +522,7 @@ export async function exportMigrateBundle(options = {}) {
     schemaVersion: MANIFEST_VERSION,
     created: new Date().toISOString(),
     role,
-    source: { host: hostnameSafe(), platform: host.platform, arch: host.arch, node: host.node, openclaw: host.openclaw },
+    source: { host: hostnameSafe(), platform: host.platform, arch: host.arch, node: host.node, openclaw: host.openclaw, openclawPinned: host.openclawPinned },
     configPathHitsLiteralized: pathHits,
     keychainImported: Object.keys(kc.secrets),
     keychainMissing: kc.missing,
@@ -655,7 +684,7 @@ function BUNDLE_NAME_STEG() {
 
 function parseArgs(argv) {
   const args = { output: null, passphrase: null, role: 'primary', cronsFile: null,
-    keychainServices: [], targetPlatform: null, dryRun: false, help: false };
+    keychainServices: [], targetPlatform: null, dryRun: false, serve: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => { if (i + 1 >= argv.length) { console.error(`❌ ${a} requires a value`); process.exit(1); } return argv[++i]; };
@@ -667,6 +696,7 @@ function parseArgs(argv) {
       case '--target-platform': args.targetPlatform = val(); break;
       case '--keychain-service': args.keychainServices.push(val()); break;
       case '--dry-run': args.dryRun = true; break;
+      case '--serve': args.serve = true; break;
       case '--help': args.help = true; break;
       default: console.error(`❌ Unknown flag: ${a}`); process.exit(1);
     }
@@ -690,6 +720,7 @@ Flags:
                              (darwin|linux; default: source host platform)
   --keychain-service <svc>   Extra keychain service to include (repeatable)
   --dry-run                  Show plan without writing anything
+  --serve                     Export + start download server (Option D)
   --help                     This help
 
 SECURITY: the bundle is encrypted (AES-256-GCM, scrypt). Delete it after import.`);
@@ -700,6 +731,12 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
   if (args.help) { printHelp(); process.exit(0); }
   (async () => {
     try {
+      if (args.serve) {
+        // --serve: export then hand off to migrate-serve.mjs
+        const { runServe } = await import('./migrate-serve.mjs');
+        await runServe(args);
+        return; // runServe spawns the server child and exits when it exits
+      }
       const res = await exportMigrateBundle(args);
       if (res.dryRun) {
         console.log('DRY RUN — no files written.');

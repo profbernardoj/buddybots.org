@@ -84,6 +84,35 @@ test('deps platform-aware: target linux emits apt', () => {
   if (!m.commands.join('\n').includes('brew install node')) throw new Error('darwin target missing brew');
 });
 
+test('version pin: never installs openclaw@latest (David, 2026-08-31)', async () => {
+  const { probeOpenclawVersion } = await import('./migrate-export.mjs');
+  const d = buildDependencyManifest({ plugins: { entries: {} } }, 'darwin');
+  const v = probeOpenclawVersion();
+  const joined = d.commands.join('\n');
+  // Must install a pinned version, never @latest
+  if (joined.includes('openclaw@latest')) throw new Error('dep manifest installs @latest — forbidden');
+  if (!new RegExp(`openclaw@\\d`).test(joined)) throw new Error(`dep manifest missing pinned install: ${joined}`);
+  // Probed or fallback version must be a real version shape
+  if (!/^\d{4}\.\d+\.\d+[-.]\d+$/.test(v)) throw new Error(`probeOpenclawVersion bad shape: ${v}`);
+});
+
+test('version pin: memory says 2026.7.1-2 fallback when openclaw binary absent', async () => {
+  // probeOpenclawVersion falls back to PINNED_OPENCLAW_VERSION (2026.7.1-2)
+  // when the openclaw binary is missing or the version regex fails.
+  const { probeOpenclawVersion } = await import('./migrate-export.mjs');
+  const v = probeOpenclawVersion();
+  // On this dev host the real binary IS present (2026.7.1-2), so both paths
+  // must yield a valid pin — never null, never 'latest'.
+  if (!v || v === 'latest') throw new Error(`bad pin: ${v}`);
+});
+
+test('version pin: linux uses NodeSource (David approved NodeSource apt)', () => {
+  const d = buildDependencyManifest({ plugins: { entries: {} } }, 'linux');
+  const joined = d.commands.join('\n');
+  if (!joined.includes('deb.nodesource.com')) throw new Error('linux target missing NodeSource');
+  if (!/^apt-get install -y nodejs$/m.test(joined)) throw new Error('linux NodeSource nodejs install missing');
+});
+
 test('worker role disables all crons', () => {
   const jobs = [{ name: 'a', enabled: true }, { name: 'b', enabled: true }];
   const out = applyCronRole(jobs, 'worker');
@@ -194,7 +223,7 @@ test('export → unpack round-trip with fake openclawDir', async () => {
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'bundle.tar.gz.enc');
-  const res = exportMigrateBundle({
+  const res = await exportMigrateBundle({
     output: outPath,
     passphrase: 'test-passphrase-12345678',
     role: 'worker',
@@ -207,13 +236,13 @@ test('export → unpack round-trip with fake openclawDir', async () => {
   if (res.workspaceCount < 2) throw new Error(`workspaceCount=${res.workspaceCount}`);
 
   const staging2 = join(env.root, 'unpack');
-  const { manifest, extractDir } = unpackBundle(outPath, 'test-passphrase-12345678', staging2);
+  const { manifest, extractDir } = await unpackBundle(outPath, 'test-passphrase-12345678', staging2);
   if (manifest.schemaVersion !== '2.0') throw new Error('schema mismatch');
   if (manifest.role !== 'worker') throw new Error('role mismatch');
   if (!existsSync(join(extractDir, 'config.json.tmpl'))) throw new Error('config tmpl missing');
   if (!existsSync(join(extractDir, 'keychain.json.enc'))) throw new Error('keychain blob missing');
   if (!existsSync(join(extractDir, 'RUNBOOK.md'))) throw new Error('runbook missing');
-  if (!existsSync(join(extractDir, 'workspaces.tar.gz'))) throw new Error('workspaces missing');
+  if (!existsSync(join(extractDir, 'workspaces.tar'))) throw new Error('workspaces missing');
   const tmpl = readFileSync(join(extractDir, 'config.json.tmpl'), 'utf8');
   if (tmpl.includes(process.env.HOME)) throw new Error('config template leaked literal home path');
   // B1 regression (Claude audit): the out-of-band checksum is the SHA-256 of
@@ -232,9 +261,9 @@ test('out-of-band checksum: import succeeds with exporter-printed value (B1)', a
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'c.tar.gz.enc');
-  const res = exportMigrateBundle({ output: outPath, passphrase: 'checksum-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
+  const res = await exportMigrateBundle({ output: outPath, passphrase: 'checksum-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
   // The printed value (res.bundleChecksum) must validate the real artifact.
-  const { manifest } = unpackBundle(outPath, 'checksum-pass-12345678', join(env.root, 'u'), res.bundleChecksum);
+  const { manifest } = await unpackBundle(outPath, 'checksum-pass-12345678', join(env.root, 'u'), res.bundleChecksum);
   if (manifest.schemaVersion !== '2.0') throw new Error('schema mismatch on checksum-verified import');
   rmSync(env.root, { recursive: true, force: true });
 });
@@ -242,9 +271,9 @@ test('out-of-band checksum: wrong value rejected (B1)', async () => {
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'w.tar.gz.enc');
-  exportMigrateBundle({ output: outPath, passphrase: 'checksum-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
+  await exportMigrateBundle({ output: outPath, passphrase: 'checksum-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
   let threw = false;
-  try { unpackBundle(outPath, 'checksum-pass-12345678', join(env.root, 'u'), '0'.repeat(64)); } catch (e) { threw = /checksum MISMATCH/.test(e.message); }
+  try { await unpackBundle(outPath, 'checksum-pass-12345678', join(env.root, 'u'), '0'.repeat(64)); } catch (e) { threw = /checksum MISMATCH/.test(e.message); }
   if (!threw) throw new Error('wrong out-of-band checksum accepted');
   rmSync(env.root, { recursive: true, force: true });
 });
@@ -252,12 +281,12 @@ test('out-of-band checksum: byte-flipped bundle rejected (B1)', async () => {
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'f.tar.gz.enc');
-  const res = exportMigrateBundle({ output: outPath, passphrase: 'checksum-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
+  const res = await exportMigrateBundle({ output: outPath, passphrase: 'checksum-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
   const blob = readFileSync(outPath);
   blob[10] = blob[10] ^ 0xff;                 // flip one byte of the encrypted file
   writeFileSync(outPath, blob);
   let threw = false;
-  try { unpackBundle(outPath, 'checksum-pass-12345678', join(env.root, 'u'), res.bundleChecksum); } catch (e) { threw = /checksum MISMATCH/.test(e.message); }
+  try { await unpackBundle(outPath, 'checksum-pass-12345678', join(env.root, 'u'), res.bundleChecksum); } catch (e) { threw = /checksum MISMATCH/.test(e.message); }
   if (!threw) throw new Error('tampered encrypted bundle accepted with out-of-band checksum');
   rmSync(env.root, { recursive: true, force: true });
 });
@@ -272,9 +301,9 @@ test('unpack with wrong passphrase fails cleanly', async () => {
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'b.tar.gz.enc');
-  exportMigrateBundle({ output: outPath, passphrase: 'right-passphrase-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
+  await exportMigrateBundle({ output: outPath, passphrase: 'right-passphrase-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
   let threw = false;
-  try { unpackBundle(outPath, 'wrong-passphrase-99999999', join(env.root, 'u')); } catch (e) { threw = /wrong passphrase/.test(e.message); }
+  try { await unpackBundle(outPath, 'wrong-passphrase-99999999', join(env.root, 'u')); } catch (e) { threw = /wrong passphrase/.test(e.message); }
   if (!threw) throw new Error('wrong passphrase accepted');
   rmSync(env.root, { recursive: true, force: true });
 });
@@ -284,24 +313,24 @@ test('tampered payload file rejected by checksum gate', async () => {
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 't.tar.gz.enc');
-  exportMigrateBundle({ output: outPath, passphrase: 'tamper-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
+  await exportMigrateBundle({ output: outPath, passphrase: 'tamper-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
 
-  // Decrypt, untar, modify a checksummed payload file, re-tar, re-encrypt.
-  const blob = readFileSync(outPath);
-  const plainTar = decryptBuffer(blob, 'tamper-pass-12345678');
+  // Decrypt (streaming format — tag at end, not after IV), untar, modify, re-tar, re-encrypt.
+  const { decryptFileStreaming } = await import('./migrate-export.mjs');
   const tamperDir = join(env.root, 'tamper');
   mkdirSync(tamperDir, { recursive: true });
-  const tamperedTar = join(tamperDir, 'plain.tar.gz');
-  writeFileSync(tamperedTar, plainTar);
-  execFileSync('tar', ['-xzf', tamperedTar, '-C', tamperDir]);
-  rmSync(tamperedTar, { force: true });  // remove intermediate tar before re-tar
+  const plainTar = join(tamperDir, 'plain.tar');
+  await decryptFileStreaming(outPath, plainTar, 'tamper-pass-12345678');
+  execFileSync('tar', ['-xf', plainTar, '-C', tamperDir]);
+  rmSync(plainTar, { force: true });  // remove intermediate tar before re-tar
   writeFileSync(join(tamperDir, 'config.json.tmpl'), '{"tampered": true, "home": "{{HOME}}"}');
-  const evilTar = join(env.root, 'evil.tar.gz');
-  execFileSync('tar', ['-czf', evilTar, '-C', tamperDir, '.']);
-  writeFileSync(outPath, encryptBuffer(readFileSync(evilTar), 'tamper-pass-12345678'));
+  const evilTar = join(env.root, 'evil.tar');
+  execFileSync('tar', ['-cf', evilTar, '-C', tamperDir, '.']);
+  const { encryptFileStreaming: encStream } = await import('./migrate-export.mjs');
+  await encStream(evilTar, outPath, 'tamper-pass-12345678');
 
   let threw = false;
-  try { unpackBundle(outPath, 'tamper-pass-12345678', join(env.root, 'u2')); } catch (e) { threw = /integrity check FAILED/.test(e.message) && /config.json.tmpl/.test(e.message); }
+  try { await unpackBundle(outPath, 'tamper-pass-12345678', join(env.root, 'u2')); } catch (e) { threw = /integrity check FAILED/.test(e.message) && /config.json.tmpl/.test(e.message); }
   if (!threw) throw new Error('tampered bundle accepted — checksum gate not enforced');
   rmSync(env.root, { recursive: true, force: true });
 });
@@ -311,30 +340,30 @@ test('tampered manifest.json rejected by self-checksum gate (R10)', async () => 
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'm.tar.gz.enc');
-  exportMigrateBundle({ output: outPath, passphrase: 'tamper-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
+  await exportMigrateBundle({ output: outPath, passphrase: 'tamper-pass-12345678', role: 'primary', openclawDir: env.openclawDir, cronsFile: env.cronsFile, keychainServices: [], stagingDir: join(env.root, 's') });
 
   // A clean bundle must pass the integrity gate (self-checksum round-trips).
-  unpackBundle(outPath, 'tamper-pass-12345678', join(env.root, 'u0'));
+  await unpackBundle(outPath, 'tamper-pass-12345678', join(env.root, 'u0'));
 
-  // Decrypt, untar, tamper ONLY the manifest, re-tar, re-encrypt.
-  const blob = readFileSync(outPath);
-  const plainTar = decryptBuffer(blob, 'tamper-pass-12345678');
+  // Decrypt (streaming format), untar, tamper ONLY the manifest, re-tar, re-encrypt.
+  const { decryptFileStreaming: decStream } = await import('./migrate-export.mjs');
   const tamperDir = join(env.root, 'mtamper');
   mkdirSync(tamperDir, { recursive: true });
-  const plain = join(tamperDir, 'plain.tar.gz');
-  writeFileSync(plain, plainTar);
-  execFileSync('tar', ['-xzf', plain, '-C', tamperDir]);
+  const plain = join(tamperDir, 'plain.tar');
+  await decStream(outPath, plain, 'tamper-pass-12345678');
+  execFileSync('tar', ['-xf', plain, '-C', tamperDir]);
   rmSync(plain, { force: true });  // remove intermediate tar before re-tar
   const manPath = join(tamperDir, 'manifest.json');
   const man = JSON.parse(readFileSync(manPath, 'utf8'));
   man.tampered = true;                       // change a top-level field
   writeFileSync(manPath, JSON.stringify(man, null, 2) + '\n');
-  const evilTar = join(env.root, 'evil-m.tar.gz');
-  execFileSync('tar', ['-czf', evilTar, '-C', tamperDir, '.']);
-  writeFileSync(outPath, encryptBuffer(readFileSync(evilTar), 'tamper-pass-12345678'));
+  const evilTar = join(env.root, 'evil-m.tar');
+  execFileSync('tar', ['-cf', evilTar, '-C', tamperDir, '.']);
+  const { encryptFileStreaming: encStream2 } = await import('./migrate-export.mjs');
+  await encStream2(evilTar, outPath, 'tamper-pass-12345678');
 
   let threw = false;
-  try { unpackBundle(outPath, 'tamper-pass-12345678', join(env.root, 'u1')); } catch (e) { threw = /manifest.json/.test(e.message); }
+  try { await unpackBundle(outPath, 'tamper-pass-12345678', join(env.root, 'u1')); } catch (e) { threw = /manifest.json/.test(e.message); }
   if (!threw) throw new Error('tampered manifest accepted — self-checksum gate not enforced');
   rmSync(env.root, { recursive: true, force: true });
 });
@@ -360,7 +389,7 @@ test('parseArgs [] does not mask keychain defaults (Claude R1)', async () => {
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'd.tar.gz.enc');
-  const res = exportMigrateBundle({
+  const res = await exportMigrateBundle({
     output: outPath,
     passphrase: 'default-test-pass-12345678',
     role: 'primary',
@@ -380,11 +409,11 @@ test('parseArgs null does not mask targetPlatform default (Claude R1)', async ()
   // parseArgs seeds targetPlatform: null — the destructure default must NOT
   // be bypassed by null. Verify by checking the dependency manifest has
   // platform-specific commands (brew on darwin, apt on linux), not just
-  // the generic `npm install -g openclaw@latest`.
+  // the pinned version (probeOpenclawVersion falls back to 2026.7.1-2 if the binary is missing).
   const env = makeFakeEnv();
   const { exportMigrateBundle } = await import('./migrate-export.mjs');
   const outPath = join(env.root, 'p.tar.gz.enc');
-  const res = exportMigrateBundle({
+  const res = await exportMigrateBundle({
     output: outPath,
     passphrase: 'platform-test-pass-12345678',
     role: 'primary',
@@ -408,7 +437,7 @@ test('export honours MIGRATE_PASSPHRASE when --passphrase absent (Claude R4)', a
   const prev = process.env.MIGRATE_PASSPHRASE;
   process.env.MIGRATE_PASSPHRASE = 'env-passphrase-12345678';
   try {
-    const res = exportMigrateBundle({
+    const res = await exportMigrateBundle({
       output: join(env.root, 'e.tar.gz.enc'),
       passphrase: null,            // exactly what parseArgs produces
       openclawDir: env.openclawDir,

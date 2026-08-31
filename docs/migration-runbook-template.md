@@ -69,7 +69,7 @@ The importer:
 
 ## Post-Import Checklist
 
-- [ ] Install dependencies from the dependency manifest (`brew install node`, `npm install -g openclaw@latest`, plugins, ollama models)
+- [ ] Install dependencies from the dependency manifest (`brew install node`, `npm install -g openclaw@<pinned-version>`, plugins, ollama models)
 - [ ] Re-enable skills (agent reads `pending-cron-import.json` and creates each cron job via gateway API)
 - [ ] Run `openclaw doctor` — verify skills are healthy
 - [ ] Relink Signal (one number per instance — not portable)
