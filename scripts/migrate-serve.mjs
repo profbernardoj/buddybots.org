@@ -3,8 +3,8 @@
  * migrate-serve.mjs — Source-side migration orchestrator (Gap 8 simplification, Option D)
  *
  * Turns the 10-step manual migration into 2 commands:
- *   SOURCE: node migrate-serve.mjs [--output <dir>] [--role primary|worker] ...
- *   TARGET: curl -fsSL http://<source-ip>:18790/install | bash
+ *   SOURCE: node migrate-serve.mjs [--output-dir <dir>] [--role primary|worker] ...
+ *   TARGET: curl -fsSL http://<source-ip>:18790/install/<token> | bash
  *
  * Flow:
  *   1. Run exportMigrateBundle() (existing, unchanged crypto/bundle format)
@@ -118,9 +118,13 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     '[ "$ACTUAL" = "$BUNDLE_SHA256" ] || die "checksum MISMATCH — bundle tampered or truncated; do not import"',
     'say "Checksum OK."',
     '',
-    '# ── 5. Install Node.js if absent ─────────────────────────────────',
-    'if ! command -v node >/dev/null 2>&1; then',
-    '  say "Installing Node.js…"',
+    '# ── 5. Install Node.js ≥22 if absent or too old (existence ≠ version) ──',
+    'NODE_MAJOR=0',
+    'if command -v node >/dev/null 2>&1; then',
+    '  NODE_MAJOR="$(node --version 2>/dev/null | sed \'s/^v//; s/\\..*//\')"',
+    'fi',
+    'if [ "${NODE_MAJOR:-0}" -lt 22 ]; then',
+    '  say "Installing Node.js ≥22 (found: ${NODE_MAJOR:-none})…"',
     '  if [ "$OS" = "Darwin" ]; then',
     '    command -v brew >/dev/null 2>&1 || die "Homebrew missing — install from https://brew.sh then re-run"',
     '    brew install node',
@@ -141,8 +145,8 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     '',
     '# ── 6. Install PINNED OpenClaw (never @latest — 8.1.x unstable for this setup) ──',
     'say "Installing openclaw@$OPENCLAW_PIN…"',
-    '# Try with sudo (Linux), fall back to non-sudo (macOS / already-root)',
-    'sudo npm install -g "openclaw@$OPENCLAW_PIN" 2>/dev/null || npm install -g "openclaw@$OPENCLAW_PIN"',
+    '# Prefer user/global npm first; elevate only if needed (keeps real errors visible)',
+    'npm install -g "openclaw@$OPENCLAW_PIN" || sudo npm install -g "openclaw@$OPENCLAW_PIN"',
     '',
     '# ── 7. Passphrase (NEVER argv — read from tty) ───────────────────',
     'say "Enter the migration passphrase (set by the source operator):"',
@@ -200,8 +204,9 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
 export async function runServe(options = {}) {
   const { exportMigrateBundle, probeOpenclawVersion } = await import('./migrate-export.mjs');
 
-  // --no-serve: export only, do not start the download server (Grok R2 fix)
-  if (options.noServe) {
+  // --no-serve / --dry-run: export only, do not start the download server
+  // (Grok R2 + Claude Stage4 R1: dry-run has no outputPath and would crash)
+  if (options.noServe || options.dryRun) {
     return await exportMigrateBundle(options);
   }
 

@@ -119,6 +119,22 @@ test('linux package managers refresh cache before install (R2/R4)', () => {
   if (!sampleScript.includes('sudo dnf makecache')) throw new Error('dnf makecache missing');
 });
 
+test('Node install triggers on version <22 not just absence (Claude Stage4 R1)', () => {
+  if (!sampleScript.includes('NODE_MAJOR')) throw new Error('NODE_MAJOR version probe missing');
+  if (!/-lt 22/.test(sampleScript)) throw new Error('Node major version gate (-lt 22) missing');
+  if (sampleScript.includes('if ! command -v node >/dev/null 2>&1; then')) {
+    throw new Error('old presence-only Node guard still present');
+  }
+});
+
+test('npm install tries non-sudo first then sudo (Claude Stage4 R1)', () => {
+  const m = sampleScript.match(/npm install -g "openclaw@\$OPENCLAW_PIN"[\s\S]{0,80}sudo npm install -g "openclaw@\$OPENCLAW_PIN"/);
+  if (!m) throw new Error('expected npm then sudo npm fallback order');
+  if (/sudo npm install -g "openclaw@\$OPENCLAW_PIN" 2>\/dev\/null/.test(sampleScript)) {
+    throw new Error('sudo npm still swallows stderr with 2>/dev/null');
+  }
+});
+
 test('import scripts download BEFORE bundle (server exits after bundle GET)', () => {
   const scriptsIdx = sampleScript.indexOf('/scripts/migrate-import.mjs');
   const bundleIdx = sampleScript.indexOf('$SERVER_URL/$TOKEN/$BUNDLE_NAME');
