@@ -32,7 +32,7 @@ function test(name, fn) {
 // ── generateInstallScript ───────────────────────────────────────
 
 const sampleScript = generateInstallScript({
-  serverUrl: 'http://192.168.1.42:18790',
+  serverUrl: 'http://192.0.2.1:18790',
   token: 'a]b1c2d3-e4f5-6a7b-8c9d-0e1f2g3h4i5j',
   checksumHex: 'a'.repeat(64),
   bundleName: 'migrate-bundle-202608311430.tar.gz.enc',
@@ -46,7 +46,7 @@ const sampleScript = generateInstallScript({
 });
 
 test('script contains embedded server URL', () => {
-  if (!sampleScript.includes('http://192.168.1.42:18790')) throw new Error('server URL missing');
+  if (!sampleScript.includes('http://192.0.2.1:18790')) throw new Error('server URL missing');
 });
 
 test('script contains embedded token', () => {
@@ -84,14 +84,14 @@ test('embedded values use single quotes (injection-safe, Grok R1 S-2)', () => {
     const m = line.match(/^(BUNDLE_SHA256|SERVER_URL|TOKEN|BUNDLE_NAME|OPENCLAW_PIN)="([^"]*)"$/);
     if (m) throw new Error(`double-quoted embedded constant: ${m[0]}`);
   }
-  if (!sampleScript.includes("SERVER_URL='http://192.168.1.42:18790'")) throw new Error('single-quote embedding missing');
+  if (!sampleScript.includes("SERVER_URL='http://192.0.2.1:18790'")) throw new Error('single-quote embedding missing');
 });
 
 test('single quote in any embedded value is refused (injection guard)', () => {
   let threw = false;
   try {
     generateInstallScript({
-      serverUrl: "http://192.168.1.42'; rm -rf /;#",
+      serverUrl: "http://192.0.2.1'; rm -rf /;#",
       token: 't', checksumHex: 'a'.repeat(64),
       bundleName: 'b.tar.gz.enc', openclawPin: '2026.7.1-2', bundleSize: 1,
       scriptChecksums: { 'migrate-import.mjs': 'x'.repeat(64) },

@@ -49,7 +49,7 @@ export function detectLanIp() {
  * Generate the per-session target-side install script.
  * SECURITY: passphrase is NEVER embedded — prompted on the target via /dev/tty.
  * @param {object} o
- * @param {string} o.serverUrl   e.g. http://192.168.1.42:18790
+ * @param {string} o.serverUrl   e.g. http://192.0.2.1:18790  (RFC 5737 doc range)
  * @param {string} o.token       single-use download token (UUIDv4)
  * URL + token identify one session; checksum binds script to ONE bundle.
  * @param {string} o.checksumHex    SHA-256 of the encrypted bundle (out-of-band value)
