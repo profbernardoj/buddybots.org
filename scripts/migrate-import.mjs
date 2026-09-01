@@ -22,7 +22,7 @@
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, mkdtempSync,
          createReadStream, createWriteStream, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, resolve, basename } from 'node:path';
 import { homedir, tmpdir, platform } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
@@ -380,13 +380,19 @@ export async function importMigrateBundle(options = {}) {
       report.warnings.push('keychain: no encrypted map in bundle');
     }
 
-    // Workspaces (L12). Extract candidates to a private dir and vet every tar
-    // member before anything lands in ~/.openclaw (R3 blocking fix: a
-    // passphrase holder could ship a tar with ../ traversal or symlinks).
-    const wsTar = join(extractDir, 'workspaces.tar.gz');
-    if (existsSync(wsTar)) {
+    // Workspaces (L12). Export writes UNCOMPRESSED workspaces.tar (bsdtar 2 GiB
+    // gzip limit — Claude Stage4 R3: previously looked only for .tar.gz and
+    // silently skipped every restore). Accept either name; tar -xf auto-detects.
+    // Vet every member before anything lands in ~/.openclaw (path traversal).
+    const wsTar = [
+      join(extractDir, 'workspaces.tar'),
+      join(extractDir, 'workspaces.tar.gz'),
+    ].find((p) => existsSync(p));
+    if (wsTar) {
       const safe = extractSafeWorkspaces(wsTar, openclawDir);
-      report.steps.push({ step: 'workspaces', ok: safe.ok, dir: openclawDir, skipped: safe.skipped });
+      report.steps.push({ step: 'workspaces', ok: safe.ok, dir: openclawDir, skipped: safe.skipped, source: basename(wsTar) });
+    } else if (manifest.excluded?.workspaces !== true) {
+      report.warnings.push('workspaces: no workspaces.tar in bundle — nothing restored');
     }
 
     // Skills re-enable (L2/L10)

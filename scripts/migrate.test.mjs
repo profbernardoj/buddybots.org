@@ -373,11 +373,58 @@ function makeFakeEnv() {
   const openclawDir = join(root, 'oc');
   mkdirSync(join(openclawDir, 'workspace'), { recursive: true });
   mkdirSync(join(openclawDir, 'workspace-sub'), { recursive: true });
+  // Marker files so round-trip import can prove content landed (Claude Stage4 R3).
+  writeFileSync(join(openclawDir, 'workspace', 'MEMORY.md'), '# fake memory payload\n');
+  writeFileSync(join(openclawDir, 'workspace-sub', 'AGENTS.md'), '# sub agent\n');
   writeFileSync(join(openclawDir, 'openclaw.json'), JSON.stringify({ plugins: { entries: {} }, skills: { entries: {} } }));
   const cronsFile = join(root, 'crons.json');
   writeFileSync(cronsFile, JSON.stringify([{ name: 'j', enabled: true }]));
   return { root, openclawDir, cronsFile };
 }
+
+// Claude Stage4 R3 regression: export writes workspaces.tar (uncompressed);
+// import previously looked only for workspaces.tar.gz and silently skipped.
+test('export → import restores workspaces.tar (Claude Stage4 R3)', async () => {
+  const env = makeFakeEnv();
+  const { exportMigrateBundle } = await import('./migrate-export.mjs');
+  const { importMigrateBundle } = await import('./migrate-import.mjs');
+  const outPath = join(env.root, 'rt.tar.gz.enc');
+  const res = await exportMigrateBundle({
+    output: outPath,
+    passphrase: 'roundtrip-pass-12345678',
+    role: 'primary',
+    openclawDir: env.openclawDir,
+    cronsFile: env.cronsFile,
+    keychainServices: [],
+    stagingDir: join(env.root, 's'),
+  });
+  if (res.workspaceCount < 2) throw new Error(`workspaceCount=${res.workspaceCount}`);
+
+  // Fresh target openclaw dir — force so preflight accepts overwrite.
+  const targetDir = join(env.root, 'target-oc');
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(join(targetDir, 'openclaw.json'), JSON.stringify({ plugins: { entries: {} }, skills: { entries: {} } }));
+
+  const report = await importMigrateBundle({
+    importPath: outPath,
+    passphrase: 'roundtrip-pass-12345678',
+    expectedChecksum: res.bundleChecksum,
+    openclawDir: targetDir,
+    force: true,
+  });
+  const wsStep = report.steps.find((s) => s.step === 'workspaces');
+  if (!wsStep) throw new Error(`no workspaces step — silent skip. steps=${JSON.stringify(report.steps.map(s=>s.step))}`);
+  if (wsStep.ok !== true) throw new Error(`workspaces step not ok: ${JSON.stringify(wsStep)}`);
+  if (wsStep.source !== 'workspaces.tar') throw new Error(`expected source=workspaces.tar, got ${wsStep.source}`);
+  if (!existsSync(join(targetDir, 'workspace', 'MEMORY.md'))) throw new Error('workspace/MEMORY.md not restored');
+  if (!existsSync(join(targetDir, 'workspace-sub', 'AGENTS.md'))) throw new Error('workspace-sub/AGENTS.md not restored');
+  const body = readFileSync(join(targetDir, 'workspace', 'MEMORY.md'), 'utf8');
+  if (!body.includes('fake memory payload')) throw new Error('workspace content not restored');
+  if ((report.warnings || []).some((w) => /no workspaces\.tar/.test(w))) {
+    throw new Error('unexpected workspaces missing warning');
+  }
+  rmSync(env.root, { recursive: true, force: true });
+});
 
 
 // ── CLI default-parameter regression (Claude R1) ────────────────
