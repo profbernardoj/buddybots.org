@@ -38,6 +38,11 @@ const sampleScript = generateInstallScript({
   bundleName: 'migrate-bundle-202608311430.tar.gz.enc',
   openclawPin: '2026.7.1-2',
   bundleSize: 52428800,  // 50 MB
+  scriptChecksums: {
+    'migrate-import.mjs': 'b'.repeat(64),
+    'migrate-export.mjs': 'c'.repeat(64),
+    'paths.mjs': 'd'.repeat(64),
+  },
 });
 
 test('script contains embedded server URL', () => {
@@ -89,9 +94,17 @@ test('single quote in any embedded value is refused (injection guard)', () => {
       serverUrl: "http://192.168.1.42'; rm -rf /;#",
       token: 't', checksumHex: 'a'.repeat(64),
       bundleName: 'b.tar.gz.enc', openclawPin: '2026.7.1-2', bundleSize: 1,
+      scriptChecksums: { 'migrate-import.mjs': 'x'.repeat(64) },
     });
   } catch { threw = true; }
   if (!threw) throw new Error('generateInstallScript accepted a single-quoted value — injection not blocked');
+});
+
+test('script includes helper-script checksum verification (Grok R3 security fix)', () => {
+  if (!sampleScript.includes("check_script migrate-import.mjs '" + 'b'.repeat(64) + "'")) throw new Error('migrate-import checksum not embedded');
+  if (!sampleScript.includes("check_script migrate-export.mjs '" + 'c'.repeat(64) + "'")) throw new Error('migrate-export checksum not embedded');
+  if (!sampleScript.includes("check_script paths.mjs '" + 'd'.repeat(64) + "'")) throw new Error('paths.mjs checksum not embedded');
+  if (!sampleScript.includes('hash_of()')) throw new Error('hash_of helper function missing');
 });
 
 test('linux install steps use sudo (rootless-user fix)', () => {

@@ -22,7 +22,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync, mkdtempSync, rmSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname, resolve, basename } from 'node:path';
 import { tmpdir, hostname, networkInterfaces } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -56,8 +56,10 @@ export function detectLanIp() {
  * @param {string} o.bundleName      e.g. migrate-bundle-202608311430.tar.gz.enc
  * @param {string} o.openclawPin     e.g. 2026.7.1-2 (NEVER 'latest')
  * @param {number} o.bundleSize   bytes (for progress display)
+ * @param {object} [o.scriptChecksums] name → sha256hex for the three served
+ *        helper scripts (Grok R3 fix: verify over plain HTTP before executing).
  */
-export function generateInstallScript({ serverUrl, token, checksumHex, bundleName, openclawPin, bundleSize }) {
+export function generateInstallScript({ serverUrl, token, checksumHex, bundleName, openclawPin, bundleSize, scriptChecksums = {} }) {
   const sizeMb = ( bundleSize / 1024 / 1024 ).toFixed(1);
   // Placeholder tokens (not JS template interpolation) so shell ${VAR} refs
   // survive as literal text. Every generated script is bound to ONE session:
@@ -94,6 +96,15 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     'curl -fsSL -o "$WORKDIR/migrate-import.mjs" "$SERVER_URL/scripts/migrate-import.mjs?token=$TOKEN" || die "import script download failed"',
     'curl -fsSL -o "$WORKDIR/migrate-export.mjs" "$SERVER_URL/scripts/migrate-export.mjs?token=$TOKEN" || die "export script download failed (crypto dependency)"',
     'curl -fsSL -o "$WORKDIR/paths.mjs" "$SERVER_URL/scripts/paths.mjs?token=$TOKEN" || die "paths.mjs download failed (path constants)"',
+    '',
+    '# ── 2b. Verify script checksums BEFORE execution (plain HTTP is untrusted — Grok R3) ──',
+    'hash_of() { sha256sum "$1" 2>/dev/null | awk \'{print $1}\' || shasum -a 256 "$1" | awk \'{print $1}\'; }',
+    'check_script() { local name="$1" want="$2" got; got="$(hash_of "$WORKDIR/$name")";',
+    '  [ "$got" = "$want" ] || die "$name checksum MISMATCH (got ${got:0:12}…, want ${want:0:12}…) — do NOT run tampered scripts"; }',
+    "check_script migrate-import.mjs '__SCRIPT_SHA_IMPORT__'",
+    "check_script migrate-export.mjs '__SCRIPT_SHA_EXPORT__'",
+    "check_script paths.mjs '__SCRIPT_SHA_PATHS__'",
+    'say "Import scripts verified."',
     '',
     '# ── 3. Download the bundle (single-use token — LAST fetch: server exits after) ──',
     'say "Downloading bundle $BUNDLE_NAME…"',
@@ -163,7 +174,8 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     '',
   ].join('\n');
   // Assert no single quotes in embedded values (injection guard for single-quote embedding)
-  for ( const [ k, v ] of Object.entries( { serverUrl, token, checksumHex, bundleName, openclawPin } ) ) {
+  const embedded = { serverUrl, token, checksumHex, bundleName, openclawPin, ...scriptChecksums };
+  for ( const [ k, v ] of Object.entries( embedded ) ) {
     if ( typeof v === 'string' && v.includes("'") ) {
       throw new Error( `Refusing to generate install script: ${k} contains a single quote (injection risk)` );
     }
@@ -174,7 +186,10 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     .replaceAll('__TOKEN__', token)
     .replaceAll('__BUNDLE_NAME__', bundleName)
     .replaceAll('__OPENCLAW_PIN__', openclawPin)
-    .replaceAll('__BUNDLE_SIZE_MB__', sizeMb);
+    .replaceAll('__BUNDLE_SIZE_MB__', sizeMb)
+    .replaceAll('__SCRIPT_SHA_IMPORT__', scriptChecksums['migrate-import.mjs'] || '')
+    .replaceAll('__SCRIPT_SHA_EXPORT__', scriptChecksums['migrate-export.mjs'] || '')
+    .replaceAll('__SCRIPT_SHA_PATHS__', scriptChecksums['paths.mjs'] || '');
 }
 
 /**
@@ -208,6 +223,13 @@ export async function runServe(options = {}) {
     bundleName: basename(res.outputPath),
     openclawPin,
     bundleSize: statSync(res.outputPath).size,
+    // Grok R3 fix: bind the served helper scripts to known hashes so a
+    // plain-HTTP attacker cannot swap the import code before it runs.
+    scriptChecksums: {
+      'migrate-import.mjs': sha256OfFile(join(__dirname, 'migrate-import.mjs')),
+      'migrate-export.mjs': sha256OfFile(join(__dirname, 'migrate-export.mjs')),
+      'paths.mjs': sha256OfFile(join(__dirname, 'paths.mjs')),
+    },
   });
 
   // Write install script to a temp file the server will serve
@@ -218,7 +240,7 @@ export async function runServe(options = {}) {
   console.log('┌──────────────────────────────────────────────────────────────');
   console.log('│ BuddyBots Migration — source serving on :18790');
   console.log(`│ Bundle: ${res.outputPath}`);
-  console.log(`│ Size: ${( statSizeOf(res.outputPath) / 1024 / 1024 ).toFixed(1)} MB · SHA-256: ${res.bundleChecksum.slice(0, 12)}…`);
+  console.log(`│ Size: ${( statSync(res.outputPath).size / 1024 / 1024 ).toFixed(1)} MB · SHA-256: ${res.bundleChecksum.slice(0, 12)}…`);
   console.log('│');
   console.log('│ On the TARGET machine, run:');
   console.log(`│   curl -fsSL ${serverUrl}/install/${token} | bash`);
@@ -245,6 +267,10 @@ export async function runServe(options = {}) {
 }
 
 // ── CLI ──────────────────────────────────────────────────────────
+
+function sha256OfFile(p) {
+  return createHash('sha256').update(readFileSync(p)).digest('hex');
+}
 
 function parseArgs(argv) {
   const args = { output: null, outputDir: null, passphrase: null, role: 'primary',
