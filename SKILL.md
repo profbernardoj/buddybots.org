@@ -2476,7 +2476,7 @@ bundle.tar.gz.enc (AES-256-GCM + scrypt)
     ├── keychain.json.enc        # keychain secrets (encrypted, never cleartext)
     ├── cron-jobs.json           # JSON API import (never SQL)
     ├── skills-state.json        # skills + .wanted map (doctor-disabled re-enabled)
-    ├── workspaces.tar.gz        # main workspace + workspace-* sub-agents
+    ├── workspaces.tar           # main workspace + workspace-* sub-agents (uncompressed)
     └── RUNBOOK.md               # generated import instructions
 ```
 

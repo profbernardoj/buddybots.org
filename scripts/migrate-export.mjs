@@ -20,7 +20,7 @@
  *   config.json.tmpl         — openclaw.json with {{HOME}} literalized
  *   keychain.json.enc        — secret map, AES-256-GCM (bundle passphrase)
  *   cron-jobs.json           — cron definitions (JSON, version-tolerant)
- *   workspaces.tar.gz        — main workspace + sub-agent workspaces
+ *   workspaces.tar           — main workspace + sub-agent workspaces (uncompressed)
  *   skills-state.json        — skills.entries enabled map
  *   RUNBOOK.md               — generated ordered steps for THIS bundle
  */
