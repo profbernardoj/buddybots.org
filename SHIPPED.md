@@ -2,7 +2,7 @@
 
 ## 2026.9.1.1315 — Source-Served Migration (Gap 8, Option D)
 
-**SOP-001 Pipeline:** ALL STAGES COMPLETE (0-9). Stage 10 (real round-trip validation) pending — non-blocking.
+**SOP-001 Pipeline:** Stages 0-9 COMPLETE (deployed). Stage 10 (real round-trip validation) IN PROGRESS — tester report created 2026-09-01, handed to real testers; results pending. Non-blocking.
 
 ### What Shipped
 
