@@ -228,8 +228,18 @@ const server = createServer((req, res) => {
   }
 
   // ── Migration endpoints (Gap 8 simplification: Option D) ──────────
-  // GET /install → serve the generated per-session install script
-  if (req.url === "/install") {
+  // GET /install/<token> → serve the generated per-session install script.
+  // Token-gated (Grok R1 S-5): the script embeds TOKEN + checksum, so only
+  // the party holding the printed one-liner can fetch it. Bundled as path
+  // segment so `curl URL | bash` works without custom headers.
+  if (req.url?.startsWith("/install")) {
+    // /install/<token> → ["", "install", "<token>"]
+    const reqToken = (req.url.split("?")[0].split("/")[2]) || "";
+    if (reqToken !== TOKEN) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid or missing install token" }));
+      return;
+    }
     if (!INSTALL_SCRIPT_PATH || !existsSync(INSTALL_SCRIPT_PATH)) {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "install script not available" }));
@@ -245,9 +255,18 @@ const server = createServer((req, res) => {
     return;
   }
 
-  // GET /scripts/<name> → serve migrate-import.mjs, migrate-export.mjs, paths.mjs
+  // GET /scripts/<name>?token=<token> → migrate-import.mjs, migrate-export.mjs, paths.mjs
+  // Token-gated the same way (no secrets inside, but avoids broadcasting that
+  // a migration is in progress). Does NOT consume the single-use token.
   if (req.url?.startsWith("/scripts/")) {
-    const name = basename(req.url.replace("/scripts/", "").split("?")[0]);
+    const [pathPart, queryPart] = req.url.split("?");
+    const qToken = new URLSearchParams(queryPart || "").get("token") || "";
+    if (qToken !== TOKEN) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid or missing token" }));
+      return;
+    }
+    const name = basename(pathPart.replace("/scripts/", ""));
     // Whitelist: only allow serving known migration scripts (no path traversal)
     const ALLOWED = new Set(["migrate-import.mjs", "migrate-export.mjs", "paths.mjs"]);
     if (!ALLOWED.has(name) || !SCRIPTS_DIR) {

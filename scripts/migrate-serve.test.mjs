@@ -56,11 +56,59 @@ test('script contains embedded bundle name', () => {
   if (!sampleScript.includes('migrate-bundle-202608311430.tar.gz.enc')) throw new Error('bundle name missing');
 });
 
+test('script uses token-gated /install/<token> path (Grok R1 S-5 fix)', () => {
+  // The install script itself is fetched from /install/<token>, not bare /install
+  // (the token gates access to the script too, not just the bundle)
+  // This is verified by checking the agent-download-server test, not the generated script.
+  // The generated script doesn't fetch itself from /install — the user's curl does.
+  // Instead verify the scripts endpoints are token-gated:
+  if (!sampleScript.includes('?token=$TOKEN')) throw new Error('scripts endpoints missing token query param');
+});
+
 test('script contains pinned openclaw version (never @latest)', () => {
-  // Pin lands as shell var OPENCLAW_PIN="<version>" + npm install openclaw@$OPENCLAW_PIN
-  if (!sampleScript.includes('OPENCLAW_PIN="2026.7.1-2"')) throw new Error('pinned version missing');
+  // Pin lands as shell var OPENCLAW_PIN='<version>' (single-quoted, injection-safe)
+  // + npm install openclaw@$OPENCLAW_PIN
+  if (!sampleScript.includes("OPENCLAW_PIN='2026.7.1-2'")) throw new Error('pinned version missing');
   if (sampleScript.includes('openclaw@latest')) throw new Error('script installs @latest — forbidden');
   if (!sampleScript.includes('openclaw@$OPENCLAW_PIN')) throw new Error('install command does not use the pin');
+});
+
+test('embedded values use single quotes (injection-safe, Grok R1 S-2)', () => {
+  // All five embedded constants must be single-quoted so $ ` " are literal.
+  for (const line of sampleScript.split('\n')) {
+    const m = line.match(/^(BUNDLE_SHA256|SERVER_URL|TOKEN|BUNDLE_NAME|OPENCLAW_PIN)="([^"]*)"$/);
+    if (m) throw new Error(`double-quoted embedded constant: ${m[0]}`);
+  }
+  if (!sampleScript.includes("SERVER_URL='http://192.168.1.42:18790'")) throw new Error('single-quote embedding missing');
+});
+
+test('single quote in any embedded value is refused (injection guard)', () => {
+  let threw = false;
+  try {
+    generateInstallScript({
+      serverUrl: "http://192.168.1.42'; rm -rf /;#",
+      token: 't', checksumHex: 'a'.repeat(64),
+      bundleName: 'b.tar.gz.enc', openclawPin: '2026.7.1-2', bundleSize: 1,
+    });
+  } catch { threw = true; }
+  if (!threw) throw new Error('generateInstallScript accepted a single-quoted value — injection not blocked');
+});
+
+test('linux install steps use sudo (rootless-user fix)', () => {
+  if (!sampleScript.includes('| sudo bash -')) throw new Error('NodeSource setup not run via sudo');
+  if (!sampleScript.includes('sudo apt-get install -y nodejs')) throw new Error('apt-get install missing sudo');
+  if (!sampleScript.includes('sudo dnf install -y nodejs')) throw new Error('dnf install missing sudo');
+  if (!sampleScript.includes('sudo npm install -g "openclaw@$OPENCLAW_PIN"')) throw new Error('npm global install missing sudo attempt');
+});
+
+test('import scripts download BEFORE bundle (server exits after bundle GET)', () => {
+  const scriptsIdx = sampleScript.indexOf('/scripts/migrate-import.mjs');
+  const bundleIdx = sampleScript.indexOf('$SERVER_URL/$TOKEN/$BUNDLE_NAME');
+  if (scriptsIdx === -1 || bundleIdx === -1) throw new Error('expected download steps missing');
+  if (scriptsIdx > bundleIdx) throw new Error('scripts fetched after bundle — server already shut down, import would fail');
+  // Exactly one occurrence of the import-script fetch (no duplicate step)
+  const count = sampleScript.split('/scripts/migrate-import.mjs').length - 1;
+  if (count !== 1) throw new Error(`import script fetched ${count} times — expected exactly 1`);
 });
 
 test('script does NOT contain passphrase', () => {

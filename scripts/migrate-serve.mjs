@@ -71,11 +71,14 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     '# Bundle: __BUNDLE_NAME__ (__BUNDLE_SIZE_MB__ MB)',
     '# One session = one bundle = one checksum. Do not reuse this script.',
     '',
-    'BUNDLE_SHA256="__CHECKSUM_HEX__"',
-    'SERVER_URL="__SERVER_URL__"',
-    'TOKEN="__TOKEN__"',
-    'BUNDLE_NAME="__BUNDLE_NAME__"',
-    'OPENCLAW_PIN="__OPENCLAW_PIN__"',
+    // Single quotes = injection-safe embedding: $ ` " are literal inside
+    // single quotes (Grok R1 S-2). Values are UUID/hex/URL/version strings —
+    // a literal single quote cannot occur; assertNoQuote guard in runServe.
+    "BUNDLE_SHA256='__CHECKSUM_HEX__'",
+    "SERVER_URL='__SERVER_URL__'",
+    "TOKEN='__TOKEN__'",
+    "BUNDLE_NAME='__BUNDLE_NAME__'",
+    "OPENCLAW_PIN='__OPENCLAW_PIN__'",
     'WORKDIR="$(mktemp -d /tmp/buddy-migrate.XXXXXX)"',
     "trap 'rm -rf \"$WORKDIR\"' EXIT",
     '',
@@ -86,46 +89,47 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     'OS="$(uname -s)"; ARCH="$(uname -m)"',
     'say "Target: $OS $ARCH"',
     '',
-    '# ── 2. Download the bundle (single-use token) ────────────────────',
+    '# ── 2. Download import scripts FIRST — the bundle download ends the server ──',
+    'say "Downloading import scripts…"',
+    'curl -fsSL -o "$WORKDIR/migrate-import.mjs" "$SERVER_URL/scripts/migrate-import.mjs?token=$TOKEN" || die "import script download failed"',
+    'curl -fsSL -o "$WORKDIR/migrate-export.mjs" "$SERVER_URL/scripts/migrate-export.mjs?token=$TOKEN" || die "export script download failed (crypto dependency)"',
+    'curl -fsSL -o "$WORKDIR/paths.mjs" "$SERVER_URL/scripts/paths.mjs?token=$TOKEN" || die "paths.mjs download failed (path constants)"',
+    '',
+    '# ── 3. Download the bundle (single-use token — LAST fetch: server exits after) ──',
     'say "Downloading bundle $BUNDLE_NAME…"',
     'curl -fsSL -o "$WORKDIR/$BUNDLE_NAME" "$SERVER_URL/$TOKEN/$BUNDLE_NAME" \\',
     '  || die "download failed — is the source server still up? (15-min timeout, single use)"',
     'say "Bundle downloaded."',
     '',
-    '# ── 3. Verify SHA-256 (out-of-band checksum gate: same value the source printed) ──',
+    '# ── 4. Verify SHA-256 (out-of-band checksum gate: same value the source printed) ──',
     'say "Verifying checksum…"',
     'ACTUAL="$(sha256sum "$WORKDIR/$BUNDLE_NAME" 2>/dev/null | awk \'{print $1}\' || shasum -a 256 "$WORKDIR/$BUNDLE_NAME" | awk \'{print $1}\')"',
     '[ "$ACTUAL" = "$BUNDLE_SHA256" ] || die "checksum MISMATCH — bundle tampered or truncated; do not import"',
     'say "Checksum OK."',
     '',
-    '# ── 4. Install Node.js if absent ─────────────────────────────────',
+    '# ── 5. Install Node.js if absent ─────────────────────────────────',
     'if ! command -v node >/dev/null 2>&1; then',
     '  say "Installing Node.js…"',
     '  if [ "$OS" = "Darwin" ]; then',
     '    command -v brew >/dev/null 2>&1 || die "Homebrew missing — install from https://brew.sh then re-run"',
     '    brew install node',
     '  elif command -v apt-get >/dev/null 2>&1; then',
-    '    # NodeSource (David approved 2026-08-31)',
-    '    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -',
-    '    apt-get install -y nodejs',
+    '    # NodeSource + sudo (David approved 2026-08-31, Grok R1 fix)',
+    '    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -',
+    '    sudo apt-get install -y nodejs',
     '  elif command -v dnf >/dev/null 2>&1; then',
-    '    curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -',
-    '    dnf install -y nodejs',
+    '    curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -',
+    '    sudo dnf install -y nodejs',
     '  else',
     '    die "Unsupported package manager — install Node.js ≥22 manually, then re-run"',
     '  fi',
     'fi',
     'say "Node.js $(node --version)."',
     '',
-    '# ── 5. Install PINNED OpenClaw (never @latest — 8.1.x unstable for this setup) ──',
+    '# ── 6. Install PINNED OpenClaw (never @latest — 8.1.x unstable for this setup) ──',
     'say "Installing openclaw@$OPENCLAW_PIN…"',
-    'npm install -g "openclaw@$OPENCLAW_PIN"',
-    '',
-    '# ── 6. download import scripts from the SAME source server ───────',
-    'say "Downloading import scripts…"',
-    'curl -fsSL -o "$WORKDIR/migrate-import.mjs" "$SERVER_URL/scripts/migrate-import.mjs" || die "import script download failed"',
-    'curl -fsSL -o "$WORKDIR/migrate-export.mjs" "$SERVER_URL/scripts/migrate-export.mjs" || die "export script download failed (crypto dependency)"',
-    'curl -fsSL -o "$WORKDIR/paths.mjs" "$SERVER_URL/scripts/paths.mjs" || die "paths.mjs download failed (path constants)"',
+    '# Try with sudo (Linux), fall back to non-sudo (macOS / already-root)',
+    'sudo npm install -g "openclaw@$OPENCLAW_PIN" 2>/dev/null || npm install -g "openclaw@$OPENCLAW_PIN"',
     '',
     '# ── 7. Passphrase (NEVER argv — read from tty) ───────────────────',
     'say "Enter the migration passphrase (set by the source operator):"',
@@ -137,7 +141,7 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     '# ── 8. Import ────────────────────────────────────────────────────',
     'say "Importing bundle…"',
     'node "$WORKDIR/migrate-import.mjs" \\',
-    '  --import "$WORKDIR/dollar-brace-BUNDLE_NAME" \\',
+    '  --import "$WORKDIR/$BUNDLE_NAME" \\',
     '  --expected-checksum "$BUNDLE_SHA256"',
     '',
     '# ── 9. Start gateway (David approved auto-start 2026-08-31) ──────',
@@ -157,16 +161,19 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     'EOF',
     '',
   ].join('\n');
+  // Assert no single quotes in embedded values (injection guard for single-quote embedding)
+  for ( const [ k, v ] of Object.entries( { serverUrl, token, checksumHex, bundleName, openclawPin } ) ) {
+    if ( typeof v === 'string' && v.includes("'") ) {
+      throw new Error( `Refusing to generate install script: ${k} contains a single quote (injection risk)` );
+    }
+  }
   return tmpl
     .replaceAll('__SERVER_URL__', serverUrl)
     .replaceAll('__CHECKSUM_HEX__', checksumHex)
     .replaceAll('__TOKEN__', token)
     .replaceAll('__BUNDLE_NAME__', bundleName)
     .replaceAll('__OPENCLAW_PIN__', openclawPin)
-    .replaceAll('__BUNDLE_SIZE_MB__', sizeMb)
-    // shell-side bundle name ref inside step 8 (kept literal above to avoid
-    // the __BUNDLE_NAME__ replacement clobbering the $WORKDIR prefix)
-    .replaceAll('dollar-brace-BUNDLE_NAME', '$BUNDLE_NAME');
+    .replaceAll('__BUNDLE_SIZE_MB__', sizeMb);
 }
 
 /**
@@ -207,7 +214,7 @@ export async function runServe(options = {}) {
   console.log(`│ Size: ${( statSizeOf(res.outputPath) / 1024 / 1024 ).toFixed(1)} MB · SHA-256: ${res.bundleChecksum.slice(0, 12)}…`);
   console.log('│');
   console.log('│ On the TARGET machine, run:');
-  console.log(`│   curl -fsSL ${serverUrl}/install | bash`);
+  console.log(`│   curl -fsSL ${serverUrl}/install/${token} | bash`);
   console.log('│');
   console.log('│ The server closes after the bundle is downloaded or 15 minutes.');
   console.log('│ The bundle is KEPT on this machine (backup if import fails).');
@@ -271,7 +278,7 @@ Flags: (same as migrate-export.mjs, plus)
   --output-dir <dir>  Where the bundle lands (default ~/Documents)
 
 After export, this prints the target command:
-  curl -fsSL http://<lan-ip>:18790/install | bash`);
+  curl -fsSL http://<lan-ip>:18790/install/<token> | bash`);
     process.exit(0);
   }
   runServe(args).catch(err => {
