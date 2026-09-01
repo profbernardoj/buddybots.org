@@ -116,6 +116,7 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     '  elif command -v apt-get >/dev/null 2>&1; then',
     '    # NodeSource + sudo (David approved 2026-08-31, Grok R1 fix)',
     '    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -',
+    '    sudo apt-get update',
     '    sudo apt-get install -y nodejs',
     '  elif command -v dnf >/dev/null 2>&1; then',
     '    curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -',
@@ -182,6 +183,12 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
  */
 export async function runServe(options = {}) {
   const { exportMigrateBundle, probeOpenclawVersion } = await import('./migrate-export.mjs');
+
+  // --no-serve: export only, do not start the download server (Grok R2 fix)
+  if (options.noServe) {
+    return await exportMigrateBundle(options);
+  }
+
   const token = options.token || randomUUID();
   const lanIp = options.lanIp || detectLanIp();
   const serverUrl = options.serverUrl || `http://${lanIp}:${PORT}`;
@@ -198,9 +205,9 @@ export async function runServe(options = {}) {
     serverUrl,
     token,
     checksumHex: res.bundleChecksum,
-    bundleName: basenameOf(res.outputPath),
+    bundleName: basename(res.outputPath),
     openclawPin,
-    bundleSize: statSizeOf(res.outputPath),
+    bundleSize: statSync(res.outputPath).size,
   });
 
   // Write install script to a temp file the server will serve
@@ -236,9 +243,6 @@ export async function runServe(options = {}) {
 
   return { token, serverUrl, bundlePath: res.outputPath, bundleChecksum: res.bundleChecksum, child };
 }
-
-function basenameOf(p) { return basename(p); }
-function statSizeOf(p) { return statSync(p).size; }
 
 // ── CLI ──────────────────────────────────────────────────────────
 
