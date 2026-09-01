@@ -21,7 +21,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync, mkdtempSync, rmSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname, resolve, basename } from 'node:path';
-import { tmpdir, hostname, networkInterfaces } from 'node:os';
+import { tmpdir, hostname, networkInterfaces, homedir } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -131,6 +131,7 @@ export function generateInstallScript({ serverUrl, token, checksumHex, bundleNam
     '    sudo apt-get install -y nodejs',
     '  elif command -v dnf >/dev/null 2>&1; then',
     '    curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -',
+    '    sudo dnf makecache',
     '    sudo dnf install -y nodejs',
     '  else',
     '    die "Unsupported package manager — install Node.js ≥22 manually, then re-run"',
@@ -207,7 +208,7 @@ export async function runServe(options = {}) {
   const token = options.token || randomUUID();
   const lanIp = options.lanIp || detectLanIp();
   const serverUrl = options.serverUrl || `http://${lanIp}:${PORT}`;
-  const outDir = options.outputDir || join(process.env.HOME || '~', 'Documents');
+  const outDir = options.outputDir || join(homedir(), 'Documents');
   const openclawPin = options.openclawPin || probeOpenclawVersion();
 
   // Export (passphrase comes from MIGRATE_PASSPHRASE env or options)

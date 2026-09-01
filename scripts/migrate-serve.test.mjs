@@ -114,6 +114,11 @@ test('linux install steps use sudo (rootless-user fix)', () => {
   if (!sampleScript.includes('sudo npm install -g "openclaw@$OPENCLAW_PIN"')) throw new Error('npm global install missing sudo attempt');
 });
 
+test('linux package managers refresh cache before install (R2/R4)', () => {
+  if (!sampleScript.includes('sudo apt-get update')) throw new Error('apt-get update missing');
+  if (!sampleScript.includes('sudo dnf makecache')) throw new Error('dnf makecache missing');
+});
+
 test('import scripts download BEFORE bundle (server exits after bundle GET)', () => {
   const scriptsIdx = sampleScript.indexOf('/scripts/migrate-import.mjs');
   const bundleIdx = sampleScript.indexOf('$SERVER_URL/$TOKEN/$BUNDLE_NAME');
