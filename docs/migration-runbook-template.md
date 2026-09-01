@@ -44,6 +44,31 @@ The exporter prints:
 
 ## Transfer
 
+### Option A — Source-Served (same LAN, recommended)
+
+On the **source** host, export AND serve in one command:
+
+```bash
+node scripts/migrate-serve.mjs --role primary --output-dir ~/Documents
+```
+
+The command prints the target one-liner, e.g.:
+
+```bash
+curl -fsSL http://192.0.2.1:18790/install/<token> | bash
+```
+
+Run that **on the target host**. The script downloads itself, the helper
+scripts, and the encrypted bundle over HTTP, then prompts for the passphrase
+via `/dev/tty` and imports. The source server shuts down after the bundle is
+downloaded (or 15 min idle). The bundle stays on the source — it is the
+backup if import fails.
+
+> **Do not expose :18790 to the internet:** the server binds all interfaces
+> (`0.0.0.0`) — the single-use token is the only gate. Use on a trusted LAN.
+
+### Option B — Manual (offline / cross-network)
+
 - Copy the `.tar.gz.enc` file to the target host (AirDrop, rsync, USB)
 - **Communicate the SHA-256 checksum via a DIFFERENT channel** (Signal, voice, paper)
 - The checksum guards against tampering during transfer

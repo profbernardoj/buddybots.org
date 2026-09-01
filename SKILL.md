@@ -1,6 +1,6 @@
 ---
 name: everclaw
-version: 2026.8.28.2116
+version: 2026.9.1.1315
 # NOTE: Description must stay identical to root SKILL.md. Update both files together.
 description: Open-source first AI inference — GLM-5 as default, Claude as fallback only. Own your inference forever via the [REDACTED] decentralized network. Stake MOR tokens, access GLM-5, GLM-4.7 Flash, Kimi K2.5, and 30+ models with persistent inference by recycling staked MOR. Open-source first model router routes all tiers to [REDACTED] by default — Claude only kicks in as an escape hatch when needed. Includes [REDACTED] API Gateway bootstrap for zero-config startup, OpenAI-compatible proxy with auto-session management, automatic retry with fresh sessions, OpenAI-compatible error classification to prevent cooldown cascades, multi-key auth rotation v2 with proactive DIEM balance monitoring and reactive 402 watchdog, Gateway Guardian v5 with direct curl inference probes (eliminates Signal spam), proactive Venice DIEM credit monitoring, circuit breaker for stuck sub-agents, nuclear self-healing restart, always-on proxy-router with launchd auto-restart, smart session archiver, three-shift cyclic execution engine (v2 with 15-minute execution loops), 24/7 always-on power configuration for macOS, bundled security skills, zero-dependency wallet management via macOS Keychain, x402 payment client for agent-to-agent USDC payments, ERC-8004 agent registry reader for discovering trustless agents on Base, and hardware-aware local Ollama fallback with auto model selection (Gemma 4 family: E2B/E4B/26B/31B with vision + audio, based on available RAM/GPU).
 homepage: https://everclaw.com
@@ -2503,6 +2503,48 @@ differently-named target user. Missing services are reported in the manifest
 **Deliberately NOT portable:** Signal account link (one number per instance),
 session history (non-portable across versions).
 
+#### Source-Served Migration (migrate-serve — Option D)
+
+Turns the two-command export/import flow into **one command per side** when
+both hosts can reach each other (typically same LAN):
+
+```bash
+# SOURCE — export + serve the bundle over HTTP (trusted network only)
+node scripts/migrate-serve.mjs [--output-dir <dir>] [--role primary|worker] ...
+
+# TARGET — one-liner; script downloads itself + the bundle, then imports
+curl -fsSL http://<source-lan-ip>:18790/install/<token> | bash
+```
+
+**Flow (what migrate-serve does):**
+1. Runs the existing export (same encrypted bundle format v2, unchanged)
+2. Generates a per-session install script embedding the URL, token, checksum,
+   and the **pinned OpenClaw version (2026.7.1-2 — NEVER `@latest`)**
+3. Spawns `agent-download-server.mjs` with the install script + helper scripts
+   (`migrate-import.mjs`, `migrate-export.mjs`, `paths.mjs`) served over :18790
+4. Prints the one-line `curl` command for the target host
+
+**Security properties:**
+- **Token-gated endpoints** — `/install/<token>` and every script/bundle
+  download requires the single-use UUID token (403 otherwise). The token is
+  embedded in the printed command, so only the operator can fetch.
+- **Passphrase NEVER embedded** — the target prompts via `/dev/tty`;
+  the script refuses passphrases < 16 chars.
+- **Checksum binds script to ONE bundle** — the install script carries the
+  bundle SHA-256 and verifies it before importing.
+- **Script checksums verified over HTTP** before executing any downloaded
+  helper script (Grok R3 fix).
+- **Pinned OpenClaw version** — the install script installs
+  `openclaw@2026.7.1-2` (or the probed source version), never `@latest`.
+- **Server self-terminates** after bundle download or 15 minutes idle.
+- **Do not expose :18790 to the internet** — the server binds all interfaces
+  (`0.0.0.0`); the single-use token is the only gate. Use on a trusted network.
+- **Bundle kept on source** after download — it is the backup if import fails;
+  delete manually with `rm` once verified (matches runbook burn step).
+
+**Flags (same as migrate-export, plus):** `--no-serve` (export only, no
+server), `--output-dir <dir>` (default `~/Documents`).
+
 ### Backup File Format
 
 EverClaw backups are AGE-encrypted tar.zst archives containing:
@@ -2901,6 +2943,34 @@ node scripts/buddy-export.mjs --import ~/alice-backup.tar.gz --force
 ---
 
 ## Changelog
+
+### Unreleased — Source-Served Migration (Gap 8, Option D)
+- **`scripts/migrate-serve.mjs`** (new) — export + serve the bundle over LAN
+  - SOURCE: `node scripts/migrate-serve.mjs` · TARGET: `curl -fsSL http://<ip>:18790/install/<token> | bash`
+  - Per-session install script: embedded URL + single-use UUID token + bundle
+    SHA-256 + pinned OpenClaw version (2026.7.1-2, NEVER `@latest`)
+  - Spawns agent-download-server.mjs on :18790; token-gated /install and
+    script/bundle endpoints (403 without token)
+  - Passphrase never embedded — prompted on target via /dev/tty (min 16 chars)
+  - Script checksums verified over HTTP before executing (Grok R3 fix)
+  - Server self-terminates after bundle download or 15 min idle
+  - Bundle kept on source after download (backup; manual burn per runbook)
+- **`scripts/agent-download-server.mjs`** — new args: `--install-script`,
+  `--scripts-dir`, `--keep-archive`; migration endpoints under /install/<token>
+- **`scripts/migrate-export.mjs`** — probes source OpenClaw version
+  (`probeOpenclawVersion`, regex-extracted), embeds pinned fallback
+  2026.7.1-2; manifest records `openclawPinned`
+- **`scripts/migrate-import.mjs`** — restores `workspaces.tar` (uncompressed,
+  Claude Stage-4 R3: previously only `.tar.gz` matched and silently skipped
+  every workspace restore); `--dry-run` early-return; Node ≥ 22 gate
+- **`scripts/migrate.test.mjs`** — 41 tests (was 37): install-script
+  generation, injection guard, .tar.gz fallback, version probing
+- **`scripts/migrate-serve.test.mjs`** (new) — 21 tests: runServe mock,
+  token endpoints, one-liner format
+- **`docs/migration-runbook-template.md`** — pinned-version install line
+- Audited: Grok 4.20 coverage R1 = EXCELLENT (Stage 5); Claude Opus 4.8
+  cross-model R4 = Perfect (Stage 4); PII scan = 0 findings (Stage 6).
+  OpenClaw version pin 2026.7.1-2 (David, 2026-08-31): never `@latest`.
 
 ### Unreleased — Full-Host Migration (Gap 8)
 - **`scripts/migrate-export.mjs`** (614 lines) + **`scripts/migrate-import.mjs`** (506 lines)

@@ -1,5 +1,38 @@
 # Changelog
 
+## 2026.9.1.1315 — Source-Served Migration (Gap 8, Option D)
+
+### Added
+- **`scripts/migrate-serve.mjs`** (new) — one-command-per-side LAN migration
+  - SOURCE: `node scripts/migrate-serve.mjs [--output-dir <dir>] [--role primary|worker] ...`
+  - TARGET: `curl -fsSL http://<source-lan-ip>:18790/install/<token> | bash`
+  - Reuses the existing encrypted bundle format v2 — export logic unchanged
+  - Per-session install script embeds URL + single-use UUID token + bundle
+    SHA-256 + pinned OpenClaw version (2026.7.1-2, never `@latest`)
+  - Server self-terminates after bundle download or 15 min idle
+- **`scripts/migrate-serve.test.mjs`** (new) — 21 tests
+- **`scripts/agent-download-server.mjs`** — new `--install-script`,
+  `--scripts-dir`, `--keep-archive` args; migration endpoints under `/install/<token>`
+
+### Changed
+- **`scripts/migrate-export.mjs`** — probes source OpenClaw version with
+  pinned fallback; manifest records `openclawPinned`
+- **`scripts/migrate-import.mjs`** — restores `workspaces.tar` (uncompressed)
+  with `.tar.gz` fallback; `--dry-run` early-return; Node ≥ 22 gate
+- **`scripts/migrate.test.mjs`** — 41 tests (was 37)
+
+### Security
+- Token-gated HTTP endpoints (403 without the single-use token)
+- Passphrase never embedded in the served script — prompted on target via `/dev/tty`
+- Script checksums verified over HTTP before execution
+- OpenClaw installed on target from pinned version (never `@latest`)
+
+### Audited
+- Grok 4.20 (Stage 3 R1-R5 = EXCELLENT; Stage 5 coverage R1 = EXCELLENT)
+- Claude Opus 4.8 cross-model (Stage 4 R1-R4 = Perfect)
+- PII scan (Stage 6): 0 findings — RFC 5737 doc IPs in examples/tests
+- Tests: migrate 41/41 · serve 21/21 · no regressions vs baseline
+
 ## 2026.8.28.2116 — Full-Host Migration (Gap 8)
 
 ### Added — Full-Host Migration (Gap 8)

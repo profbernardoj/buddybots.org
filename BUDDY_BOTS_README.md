@@ -57,6 +57,8 @@ Friend #1 creates a group chat and adds friends. The moment the group is created
 | 6 | **Bot-to-bot coordination** | `buddy-coordinate.mjs` | 859 | ✅ 147/147 passing | ✅ Done |
 | 7 | **Scoped agent export/import** | `buddy-export.mjs` | 856 | ✅ 84/84 passing | ✅ Done |
 | 8 | **Inference quotas** | `buddy-quotas.mjs` | 960 | ✅ 50/50 passing | ✅ Done |
+| 9 | **Full-host migration** | `migrate-export.mjs` + `migrate-import.mjs` | 757+517 | ✅ 41/41 passing | ✅ Done |
+| 10 | **Source-served migration** | `migrate-serve.mjs` + `agent-download-server.mjs` | 324 | ✅ 21/21 passing | ✅ Done |
 | — | **Buddy chat CLI** | `buddy-chat.mjs` | 537 | — | ✅ Done |
 
 ### Known Issues
@@ -91,7 +93,25 @@ Portable tar.gz archive of a single agent's workspace, XMTP identity, registry e
 ### 6. Inference Quotas (`buddy-quotas.mjs`)
 Per-agent token tracking with daily/monthly limits, alert at 80%, degrade to lighter model at 90%, three cutoff actions (degrade/block/warn), 30-day history, provider+model breakdowns.
 
-### 7. Buddy Chat (`buddy-chat.mjs`)
+### 7. Full-Host Migration (`migrate-export.mjs` / `migrate-import.mjs` / `migrate-serve.mjs`)
+Whole-host migration between OpenClaw instances: config, deps, cron jobs, keychain secrets, workspaces, and skills state in one passphrase-encrypted bundle (AES-256-GCM + scrypt).
+
+```bash
+# Two-command flow:
+node scripts/migrate-export.mjs --role primary          # source
+node scripts/migrate-import.mjs --import <bundle> --expected-checksum <sha>  # target
+
+# One-command-per-side flow (same LAN):
+node scripts/migrate-serve.mjs                          # source: export + serve :18790
+curl -fsSL http://<source-ip>:18790/install/<token> | bash  # target
+```
+
+Out-of-band SHA-256 tamper gate, in-bundle checksums, token-gated HTTP
+endpoints, pinned OpenClaw version (never `@latest`), passphrase prompted on
+target via `/dev/tty`. See the migration section in SKILL.md and
+`docs/migration-runbook-template.md`.
+
+### 8. Buddy Chat (`buddy-chat.mjs`)
 CLI for sending messages between bots. Validates messages, manages conversation index, appends to message store, sends via XMTP.
 
 ---
@@ -169,6 +189,8 @@ node scripts/buddy-coordinate.mjs send \
 | Scoped agent export/import | ✅ Complete |
 | Inference quotas | ✅ Complete |
 | Buddy chat CLI | ✅ Complete |
+| Full-host migration (export/import) | ✅ Complete |
+| Source-served migration (Option D) | ✅ Complete |
 | `deprovision` export fix | ✅ Fixed (committed) |
 | Install script (`buddy-bots-install.sh`) | 📋 TODO |
 | E2E integration test (live XMTP) | 📋 TODO |
