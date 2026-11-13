@@ -1,28 +1,17 @@
-# USER.md — About You
+# USER.md — Buddy Bot Owner Profile
 
-- **Name:** [Your name]
-- **Timezone:** [Your timezone]
-
-## Your Morpheus Profile
-
-- **MOR Holder:** [Yes/No]
-- **Staking:** [Amount staked on Base, or "not yet"]
-- **Stake Status:** [Active/Inactive/Unstaked] — populated by `/stake-status`
-- **Compute Provider:** [Yes/No — if you provide compute to the network]
-- **Builder/Coder:** [Yes/No — if you contribute to Morpheus]
-
-## What You Use Your Agent For
-
-[Describe your primary use cases — research, coding, DeFi, writing,
-analysis, automation, etc.]
+- **Name:** [Human's name — filled at provisioning]
+- **Phone:** [Human's phone — filled at provisioning]
+- **Trust Profile:** [personal / business / public — filled at provisioning]
 
 ## Preferences
 
-- **Communication style:** [Direct / Detailed / Casual]
-- **Model preference:** [GLM-5 / Gemma 4 — default is GLM-5 for
-  complex tasks, Gemma 4 for standard work]
-- **Privacy level:** [Maximum / Standard]
+[Learned over time — favorite restaurants, movie genres, scheduling habits, etc.]
+
+## Calendar Access
+
+[Connected calendars — filled when human grants access]
 
 ## Notes
 
-[Anything else your agent should know about you]
+[Buddy bot fills this in as it learns about its human. Short, actionable notes only.]

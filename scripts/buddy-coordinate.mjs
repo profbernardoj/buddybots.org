@@ -24,39 +24,19 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, statSync, unlinkSync, readdirSync } from 'node:fs';
-import { join, dirname, resolve, sep } from 'node:path';
+import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir, platform } from 'node:os';
-import { STATE_DIR } from './paths.mjs';
 
 // ── Constants ────────────────────────────────────────────────────
 
-const PENDING_DIR = join(STATE_DIR, 'coordination', 'pending');
-const ARCHIVE_DIR = join(STATE_DIR, 'coordination', 'archive');
+const EVERCLAW_DIR = join(homedir(), '.everclaw');
+const PENDING_DIR = join(EVERCLAW_DIR, 'coordination', 'pending');
+const ARCHIVE_DIR = join(EVERCLAW_DIR, 'coordination', 'archive');
 
 const PROTOCOL_VERSION = '1.0';
 const DEFAULT_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_PAYLOAD_BYTES = 32 * 1024; // 32KB max per coordination payload
-
-// ── Path Safety ─────────────────────────────────────────────────
-
-/**
- * Resolve a UUID-based JSON state file path with traversal protection.
- * Validates the ID is a proper UUID v1-v5 before joining, and ensures
- * the resolved path stays within the root directory.
- * @param {string} root — base directory
- * @param {string} id — UUID identifier
- * @returns {string} safe absolute path
- */
-function safeStatePath(root, id) {
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
-    throw new Error(`Invalid identifier for path: ${id}`);
-  }
-  const candidate = resolve(root, `${id}.json`);
-  const prefix = resolve(root) + sep;
-  if (!candidate.startsWith(prefix)) throw new Error('PATH_ESCAPE');
-  return candidate;
-}
 
 // ── Coordination Types ───────────────────────────────────────────
 
@@ -430,14 +410,12 @@ export function parseCoordinationMessage(v6Data, trustProfile) {
     return { valid: false, coordination: null, errors: envelopeResult.errors };
   }
 
-  // Trust boundary is now MANDATORY and fail-closed.
-  // Unresolved / omitted profile → least privilege (public).
-  const effectiveTrust = trustProfile || 'public';
-  if (!isAllowedByTrust(coordination.type, effectiveTrust)) {
+  // Trust boundary check (when trustProfile is provided)
+  if (trustProfile && !isAllowedByTrust(coordination.type, trustProfile)) {
     return {
       valid: false,
       coordination,
-      errors: [`Type "${coordination.type}" not allowed for trust profile "${effectiveTrust}"`],
+      errors: [`Type "${coordination.type}" not allowed for trust profile "${trustProfile}"`],
     };
   }
 
@@ -481,8 +459,8 @@ export function trackRequest(envelope, targetPeer, pendingDir = PENDING_DIR) {
     status: 'pending',
   };
 
-  const filePath = safeStatePath(pendingDir, envelope.requestId);
-  const tmpPath = filePath + '.tmp.' + randomUUID();
+  const filePath = join(pendingDir, `${envelope.requestId}.json`);
+  const tmpPath = filePath + '.tmp.' + process.pid;
   writeFileSync(tmpPath, JSON.stringify(record, null, 2));
   renameSync(tmpPath, filePath);
 }
@@ -496,7 +474,7 @@ export function trackRequest(envelope, targetPeer, pendingDir = PENDING_DIR) {
  * @param {string} [archiveDir]
  */
 export function resolveRequest(requestId, status = 'resolved', pendingDir = PENDING_DIR, archiveDir = ARCHIVE_DIR) {
-  const filePath = safeStatePath(pendingDir, requestId);
+  const filePath = join(pendingDir, `${requestId}.json`);
   if (!existsSync(filePath)) return null;
 
   const record = JSON.parse(readFileSync(filePath, 'utf8'));
@@ -505,8 +483,8 @@ export function resolveRequest(requestId, status = 'resolved', pendingDir = PEND
 
   // Move to archive
   mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
-  const archivePath = safeStatePath(archiveDir, requestId);
-  const tmpPath = archivePath + '.tmp.' + randomUUID();
+  const archivePath = join(archiveDir, `${requestId}.json`);
+  const tmpPath = archivePath + '.tmp.' + process.pid;
   writeFileSync(tmpPath, JSON.stringify(record, null, 2));
   renameSync(tmpPath, archivePath);
 
@@ -528,15 +506,11 @@ export function listPending(pendingDir = PENDING_DIR) {
   const results = [];
 
   for (const file of files) {
-    const filePath = join(pendingDir, file);
     try {
-      const record = JSON.parse(readFileSync(filePath, 'utf8'));
+      const record = JSON.parse(readFileSync(join(pendingDir, file), 'utf8'));
       results.push(record);
-    } catch (err) {
-      // Quarantine corrupt files instead of silently skipping
-      const quarantine = filePath + '.corrupt.' + Date.now();
-      try { renameSync(filePath, quarantine); } catch { /* best effort */ }
-      process.stderr.write(`[buddy-coordinate] Quarantined corrupt pending request: ${filePath} → ${quarantine}: ${err.message}\n`);
+    } catch {
+      // Skip corrupt files
     }
   }
 
@@ -577,7 +551,7 @@ export function matchResponse(coordination, senderPeer, pendingDir = PENDING_DIR
     return { matched: false, request: null, error: 'No replyTo field — cannot match to request' };
   }
 
-  const filePath = safeStatePath(pendingDir, coordination.replyTo);
+  const filePath = join(pendingDir, `${coordination.replyTo}.json`);
   if (!existsSync(filePath)) {
     return { matched: false, request: null, error: `No pending request with ID: ${coordination.replyTo}` };
   }

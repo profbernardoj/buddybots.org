@@ -272,9 +272,9 @@ assertEq(inferTrustProfile({ name: 'John', relationship: 'friend' }), 'personal'
 console.log('\n💬 generateWelcomeDM');
 
 {
-  const dm = generateWelcomeDM({ humanName: 'Alice', ownerName: 'David', groupName: 'Weekend Crew' });
+  const dm = generateWelcomeDM({ humanName: 'Alice', ownerName: 'Owner', groupName: 'Weekend Crew' });
   assert(dm.includes('Alice'), 'welcomeDM: includes human name');
-  assert(dm.includes('David'), 'welcomeDM: includes owner name');
+  assert(dm.includes('Owner'), 'welcomeDM: includes owner name');
   assert(dm.includes('Weekend Crew'), 'welcomeDM: includes group name');
   assert(dm.includes('👋'), 'welcomeDM: includes wave emoji');
 }

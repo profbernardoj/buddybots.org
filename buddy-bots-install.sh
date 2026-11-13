@@ -12,11 +12,6 @@
 #   5. Configures Buddy Bots workspace (SOUL.md, USER.md, AGENTS.md)
 #   6. Starts the agent and opens WebChat
 #
-# Note: Buddy bot provisioning (XMTP identity, CommsGuard, buddy registry)
-# is handled by `buddy-provision.mjs` after install. This installer sets
-# up the base environment; run `node scripts/buddy-provision.mjs --help`
-# to provision individual buddy bots.
-#
 # Requirements: macOS 12+ or Linux (x86_64/arm64), ~500MB disk, internet
 
 set -euo pipefail
@@ -28,7 +23,7 @@ EVERCLAW_REPO="https://github.com/EverClaw/EverClaw.git"
 WORKSPACE="${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}"
 SKILL_DIR="$WORKSPACE/skills/everclaw"
 BUDDYBOTS_DIR="$WORKSPACE/skills/buddy-bots"
-TEMPLATES_URL="https://raw.githubusercontent.com/EverClaw/buddybots.org/main/templates/buddy"
+TEMPLATES_URL="https://raw.githubusercontent.com/EverClaw/buddybots.org/main/templates"
 
 # Colors
 RED='\033[0;31m'
@@ -144,10 +139,7 @@ install_node() {
   if [[ "$OS" == "macos" ]] && command -v brew &>/dev/null; then
     brew install fnm
   else
-    local fnm_installer="/tmp/fnm-install-$$.sh"
-    curl -fsSL https://fnm.vercel.app/install -o "$fnm_installer"
-    bash "$fnm_installer" --skip-shell
-    rm -f "$fnm_installer"
+    curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell
     export PATH="$HOME/.local/share/fnm:$PATH"
     eval "$(fnm env)"
   fi
@@ -190,18 +182,10 @@ check_openclaw() {
 install_openclaw() {
   log "Installing OpenClaw..."
 
-  local installer="/tmp/openclaw-install-$$.sh"
-  if curl -fsSL https://openclaw.ai/install.sh -o "$installer" 2>/dev/null; then
-    if bash "$installer"; then
-      log "OpenClaw installed ✓"
-    else
-      warn "Official installer failed, trying npm..."
-      npm install -g openclaw
-      log "OpenClaw installed via npm ✓"
-    fi
-    rm -f "$installer"
+  if curl -fsSL https://openclaw.ai/install.sh | bash; then
+    log "OpenClaw installed ✓"
   else
-    warn "Could not download installer, trying npm..."
+    warn "Official installer failed, trying npm..."
     npm install -g openclaw
     log "OpenClaw installed via npm ✓"
   fi
@@ -295,7 +279,6 @@ configure_workspace() {
   log "Configuring Buddy Bots workspace..."
 
   mkdir -p "$WORKSPACE/memory"
-  chmod 700 "$WORKSPACE" "$HOME/.openclaw" 2>/dev/null || true
 
   # Apply Buddy Bots templates (SOUL.md, USER.md, AGENTS.md)
   local files=("SOUL.md" "USER.md" "AGENTS.md")
@@ -303,7 +286,6 @@ configure_workspace() {
   for file in "${files[@]}"; do
     if [[ ! -f "$WORKSPACE/$file" ]]; then
       if curl -fsSL "${TEMPLATES_URL}/${file}" -o "$WORKSPACE/$file" 2>/dev/null; then
-        chmod 600 "$WORKSPACE/$file"
         log "  Applied template: $file"
       else
         warn "  Could not download $file template"
@@ -317,38 +299,9 @@ configure_workspace() {
   for file in TOOLS.md HEARTBEAT.md IDENTITY.md; do
     if [[ ! -f "$WORKSPACE/$file" ]]; then
       touch "$WORKSPACE/$file"
-      chmod 600 "$WORKSPACE/$file"
       log "  Created $file"
     fi
   done
-
-  # Prompt for user info to fill USER.md placeholders
-  if [[ -f "$WORKSPACE/USER.md" ]]; then
-    local user_name="" user_phone="" trust=""
-    # Extract current placeholder values to check if substitution is needed
-    if grep -q '\[Human' "$WORKSPACE/USER.md" 2>/dev/null; then
-      echo ""
-      bold "  Let's set up your buddy bot profile:"
-      read -rp "  Your name: " user_name
-      read -rp "  Your phone (E.164, e.g. +15125551234): " user_phone
-      read -rp "  Trust profile (personal/business/public) [personal]: " trust
-      trust="${trust:-personal}"
-
-      if [[ -n "$user_name" ]]; then
-        # Portable sed: macOS needs -i '' (empty string), Linux needs -i (no arg)
-        local sed_inplace=""
-        if [[ "$OS" == "macos" ]]; then
-          sed_inplace=(sed -i '')
-        else
-          sed_inplace=(sed -i)
-        fi
-        "${sed_inplace[@]}" -e "s/\[Human's name.*\]/$user_name/" \
-                 -e "s/\[Human's phone.*\]/$user_phone/" \
-                 -e "s/\[personal.*\]/$trust/" "$WORKSPACE/USER.md" 2>/dev/null || warn "Could not fill USER.md template"
-        log "  USER.md personalized ✓"
-      fi
-    fi
-  fi
 
   log "Workspace configured ✓"
 }

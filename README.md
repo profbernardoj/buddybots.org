@@ -1,26 +1,53 @@
-# Morpheus Skill (Canonical)
+# Buddy Bots
 
-> The canonical Morpheus decentralized AI agent skill for OpenClaw
+> Multi-agent Buddy Bot provisioning, coordination, and management
 
 ## Overview
 
-This is the default/canonical flavor of the EverClaw ecosystem. It provides the full Morpheus infrastructure without domain-specific customization.
+Buddy Bots is a flavor of the [EverClaw](https://everclaw.xyz) decentralized AI agent ecosystem, powered by Morpheus Network inference.
 
-**Domain:** morpheusclaw.com  
+**Domain:** buddybots.org  
 **Default Model:** GLM-5 (via Morpheus decentralized inference)
 
-## This Is The Source
+## What This Flavor Does
 
-The `morpheus-skill` repo is the monorepo that contains:
-- `packages/core/` — All shared Morpheus infrastructure
-- `flavors/` — Per-flavor configs and persona files
-- `scripts/` — Ecosystem management scripts
+Buddy Bots extends the common Morpheus infrastructure with a complete multi-agent management system:
 
-All other flavor repos are composed from `packages/core/` + their specific `flavors/<name>/` directory.
+- **Provisioning** — Spawn and configure new buddy agents with unique identities
+- **Registry** — Track and discover buddy agents across the network
+- **Coordination** — Bot-to-bot messaging with 10 coordination message types
+- **Host Management** — Auto-provision hosts for buddy agents
+- **Export/Import** — Portable agent workspaces with XMTP identity and registry entries
+- **Quotas** — Per-agent token tracking with daily/monthly limits and alerts
 
-## License
+## Flavor-Specific Scripts
 
-MIT
+This flavor includes scripts beyond the common core:
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/buddy-provision.mjs` | Spawn and configure buddy agents |
+| `scripts/buddy-registry.mjs` | Agent registry (discover, list, manage) |
+| `scripts/buddy-coordinate.mjs` | Bot-to-bot coordination messaging |
+| `scripts/buddy-host.mjs` | Host auto-provisioning for agents |
+| `scripts/buddy-export.mjs` | Export/import agent workspaces |
+| `scripts/buddy-quotas.mjs` | Per-agent token tracking and limits |
+| `buddy-bots-install.sh` | Standalone Buddy Bots installer |
+
+## Quick Start
+
+```bash
+# Install Buddy Bots
+bash buddy-bots-install.sh
+
+# Or use the common setup with Buddy Bots overlay
+node scripts/setup.mjs --key YOUR_KEY --apply --test --restart
+```
+
+## Related
+
+- [EverClaw Monorepo](https://github.com/profbernardoj/morpheus-skill) — Source of truth
+- [Morpheus Network](https://mor.org) — Decentralized inference network
 
 ---
 
